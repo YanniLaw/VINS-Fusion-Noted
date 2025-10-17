@@ -21,6 +21,7 @@ FeatureManager::FeatureManager(Matrix3d _Rs[])
         ric[i].setIdentity();
 }
 
+// 设置两个相机的旋转外参R_i_c
 void FeatureManager::setRic(Matrix3d _ric[])
 {
     for (int i = 0; i < NUM_OF_CAM; i++)

@@ -204,7 +204,7 @@ class PinholeFullCamera : public Camera
     private:
     Parameters mParameters;
 
-    double m_inv_K11, m_inv_K13, m_inv_K22, m_inv_K23;
+    double m_inv_K11, m_inv_K13, m_inv_K22, m_inv_K23; // 内参矩阵的逆矩阵非零元素
     bool m_noDistortion;
 };
 

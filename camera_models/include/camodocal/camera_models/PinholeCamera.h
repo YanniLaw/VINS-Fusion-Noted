@@ -9,7 +9,7 @@
 
 namespace camodocal
 {
-
+// 针孔相机模型
 class PinholeCamera: public Camera
 {
 public:

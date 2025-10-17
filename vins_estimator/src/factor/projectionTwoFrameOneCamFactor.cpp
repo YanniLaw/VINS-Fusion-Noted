@@ -11,7 +11,7 @@
 
 #include "projectionTwoFrameOneCamFactor.h"
 
-Eigen::Matrix2d ProjectionTwoFrameOneCamFactor::sqrt_info;
+Eigen::Matrix2d ProjectionTwoFrameOneCamFactor::sqrt_info; // 重投影误差的平方根信息矩阵
 double ProjectionTwoFrameOneCamFactor::sum_t;
 
 ProjectionTwoFrameOneCamFactor::ProjectionTwoFrameOneCamFactor(const Eigen::Vector3d &_pts_i, const Eigen::Vector3d &_pts_j, 

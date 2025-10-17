@@ -29,7 +29,7 @@ queue<sensor_msgs::ImageConstPtr> img0_buf;
 queue<sensor_msgs::ImageConstPtr> img1_buf;
 std::mutex m_buf;
 
-
+// 接收RGB图像数据(或者双目相机中的左目)
 void img0_callback(const sensor_msgs::ImageConstPtr &img_msg)
 {
     m_buf.lock();
@@ -37,6 +37,7 @@ void img0_callback(const sensor_msgs::ImageConstPtr &img_msg)
     m_buf.unlock();
 }
 
+// 接收右目数据
 void img1_callback(const sensor_msgs::ImageConstPtr &img_msg)
 {
     m_buf.lock();
@@ -72,7 +73,7 @@ void sync_process()
 {
     while(1)
     {
-        if(STEREO)
+        if(STEREO) // 双目模式
         {
             cv::Mat image0, image1;
             std_msgs::Header header;
@@ -105,10 +106,11 @@ void sync_process()
                 }
             }
             m_buf.unlock();
+            // 从两个图像话题中找到时间戳相近的左右图像对，传入估计器中
             if(!image0.empty())
                 estimator.inputImage(time, image0, image1);
         }
-        else
+        else // 单目模式
         {
             cv::Mat image;
             std_msgs::Header header;
@@ -254,7 +256,8 @@ int main(int argc, char **argv)
     {
         sub_imu = n.subscribe(IMU_TOPIC, 2000, imu_callback, ros::TransportHints().tcpNoDelay());
     }
-    ros::Subscriber sub_feature = n.subscribe("/feature_tracker/feature", 2000, feature_callback);
+    // vins_mono里是先在另外一个节点进行tracker
+    ros::Subscriber sub_feature = n.subscribe("/feature_tracker/feature", 2000, feature_callback); // not used
     ros::Subscriber sub_img0 = n.subscribe(IMAGE0_TOPIC, 100, img0_callback);
     ros::Subscriber sub_img1;
     if(STEREO)

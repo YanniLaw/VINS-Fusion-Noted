@@ -78,7 +78,7 @@ public:
     vector<camodocal::CameraPtr> m_camera;
     double cur_time;
     double prev_time;
-    bool stereo_cam;
+    bool stereo_cam; // 是否存在双目
     int n_id;
     bool hasPrediction;
 };

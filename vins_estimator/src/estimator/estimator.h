@@ -110,7 +110,7 @@ class Estimator
     MarginalizationFlag  marginalization_flag;
     Vector3d g;
 
-    Matrix3d ric[2];
+    Matrix3d ric[2]; // camera->imu 外参
     Vector3d tic[2];
 
     Vector3d        Ps[(WINDOW_SIZE + 1)];
@@ -118,7 +118,7 @@ class Estimator
     Matrix3d        Rs[(WINDOW_SIZE + 1)];
     Vector3d        Bas[(WINDOW_SIZE + 1)];
     Vector3d        Bgs[(WINDOW_SIZE + 1)];
-    double td;
+    double td; // 传感器时间差
 
     Matrix3d back_R0, last_R, last_R0;
     Vector3d back_P0, last_P, last_P0;
@@ -173,5 +173,5 @@ class Estimator
     Eigen::Quaterniond latest_Q;
 
     bool initFirstPoseFlag;
-    bool initThreadFlag;
+    bool initThreadFlag; // 多线程初始化标志
 };

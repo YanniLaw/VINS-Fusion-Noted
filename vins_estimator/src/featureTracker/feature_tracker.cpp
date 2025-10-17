@@ -109,12 +109,12 @@ map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> FeatureTracker::trackIm
     */
     cur_pts.clear();
 
-    if (prev_pts.size() > 0)
+    if (prev_pts.size() > 0) // 上一帧提取出了特征点
     {
         TicToc t_o;
-        vector<uchar> status;
+        vector<uchar> status; // 是否找到对应点 1: 找到 0: 失败
         vector<float> err;
-        if(hasPrediction)
+        if(hasPrediction) // 有了一个预测的位置
         {
             cur_pts = predict_pts;
             cv::calcOpticalFlowPyrLK(prev_img, cur_img, prev_pts, cur_pts, status, err, cv::Size(21, 21), 1, 
@@ -126,7 +126,7 @@ map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> FeatureTracker::trackIm
                 if (status[i])
                     succ_num++;
             }
-            if (succ_num < 10)
+            if (succ_num < 10) // 成功匹配的点数太少，就增大金字塔层数再进行一次
                cv::calcOpticalFlowPyrLK(prev_img, cur_img, prev_pts, cur_pts, status, err, cv::Size(21, 21), 3);
         }
         else
@@ -339,6 +339,7 @@ void FeatureTracker::rejectWithF()
     }
 }
 
+// 读取相机内参，生成相机模型
 void FeatureTracker::readIntrinsicParameter(const vector<string> &calib_file)
 {
     for (size_t i = 0; i < calib_file.size(); i++)

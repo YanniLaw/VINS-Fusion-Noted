@@ -105,7 +105,7 @@ void readParameters(std::string config_file)
     SOLVER_TIME = fsSettings["max_solver_time"];
     NUM_ITERATIONS = fsSettings["max_num_iterations"];
     MIN_PARALLAX = fsSettings["keyframe_parallax"];
-    MIN_PARALLAX = MIN_PARALLAX / FOCAL_LENGTH;
+    MIN_PARALLAX = MIN_PARALLAX / FOCAL_LENGTH; // 归一化坐标下的视差角
 
     fsSettings["output_path"] >> OUTPUT_FOLDER;
     VINS_RESULT_PATH = OUTPUT_FOLDER + "/vio.csv";
@@ -114,7 +114,7 @@ void readParameters(std::string config_file)
     fout.close();
 
     ESTIMATE_EXTRINSIC = fsSettings["estimate_extrinsic"];
-    if (ESTIMATE_EXTRINSIC == 2)
+    if (ESTIMATE_EXTRINSIC == 2) // 让系统自己去估计
     {
         ROS_WARN("have no prior about extrinsic param, calibrate extrinsic param");
         RIC.push_back(Eigen::Matrix3d::Identity());
@@ -123,12 +123,12 @@ void readParameters(std::string config_file)
     }
     else 
     {
-        if ( ESTIMATE_EXTRINSIC == 1)
+        if ( ESTIMATE_EXTRINSIC == 1) // 有一个粗略的估计，但还是需要系统去优化这个粗略的估计
         {
             ROS_WARN(" Optimize extrinsic param around initial guess!");
             EX_CALIB_RESULT_PATH = OUTPUT_FOLDER + "/extrinsic_parameter.csv";
         }
-        if (ESTIMATE_EXTRINSIC == 0)
+        if (ESTIMATE_EXTRINSIC == 0) // 完全相信我们的估计
             ROS_WARN(" fix extrinsic param ");
 
         cv::Mat cv_T;
@@ -189,7 +189,7 @@ void readParameters(std::string config_file)
     COL = fsSettings["image_width"];
     ROS_INFO("ROW: %d COL: %d ", ROW, COL);
 
-    if(!USE_IMU)
+    if(!USE_IMU) // 如果用不到IMU，那么也就不需要估计传感器外参和td
     {
         ESTIMATE_EXTRINSIC = 0;
         ESTIMATE_TD = 0;

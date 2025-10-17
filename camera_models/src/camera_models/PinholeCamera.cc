@@ -820,7 +820,10 @@ PinholeCamera::setParameters(const PinholeCamera::Parameters& parameters)
     {
         m_noDistortion = false;
     }
-
+/* 内参矩阵为 | fx   0   cx |  逆矩阵为  | 1/fx    0    -cx/fx |
+            | 0    fy   cy|           | 0      1/fy  -cy/fy |
+            | 0    0    1 |           | 0       0       1   |
+*/
     m_inv_K11 = 1.0 / mParameters.fx();
     m_inv_K13 = -mParameters.cx() / mParameters.fx();
     m_inv_K22 = 1.0 / mParameters.fy();

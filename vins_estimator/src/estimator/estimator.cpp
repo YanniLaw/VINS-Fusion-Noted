@@ -102,13 +102,17 @@ void Estimator::setParameter()
         cout << " exitrinsic cam " << i << endl  << ric[i] << endl << tic[i].transpose() << endl;
     }
     f_manager.setRic(ric);
-    ProjectionTwoFrameOneCamFactor::sqrt_info = FOCAL_LENGTH / 1.5 * Matrix2d::Identity();
-    ProjectionTwoFrameTwoCamFactor::sqrt_info = FOCAL_LENGTH / 1.5 * Matrix2d::Identity();
-    ProjectionOneFrameTwoCamFactor::sqrt_info = FOCAL_LENGTH / 1.5 * Matrix2d::Identity();
+    // 初始化重投影误差的平方根信息矩阵， 它在 非线性优化（Bundle Adjustment, BA） 中起到了“加权”的作用。
+    // 投影误差越大 → 权重越高 → 优化器越重视该约束， 乘以焦距 f 是为了把“像素误差”转换为“归一化坐标误差”
+    // 这里使用 FOCAL_LENGTH / 1.5 而不是 FOCAL_LENGTH 纯粹是一个经验系数，用来：
+    // 1） 避免权重太大导致优化收敛震荡； 2） 在不同相机焦距下保持数值稳定性。
+    ProjectionTwoFrameOneCamFactor::sqrt_info = FOCAL_LENGTH / 1.5 * Matrix2d::Identity(); // 同一相机的两帧之间的观测约束
+    ProjectionTwoFrameTwoCamFactor::sqrt_info = FOCAL_LENGTH / 1.5 * Matrix2d::Identity(); // 不同相机（如双目）之间的约束
+    ProjectionOneFrameTwoCamFactor::sqrt_info = FOCAL_LENGTH / 1.5 * Matrix2d::Identity(); // 同一时刻两个相机的约束
     td = TD;
     g = G;
     cout << "set g " << g.transpose() << endl;
-    featureTracker.readIntrinsicParameter(CAM_NAMES);
+    featureTracker.readIntrinsicParameter(CAM_NAMES); // 读取相机内参，生成相应的相机模型
 
     std::cout << "MULTIPLE_THREAD is " << MULTIPLE_THREAD << '\n';
     if (MULTIPLE_THREAD && !initThreadFlag)
@@ -157,6 +161,13 @@ void Estimator::changeSensorType(int use_imu, int use_stereo)
     }
 }
 
+/**
+ * @brief 
+ * 
+ * @param t 当前时间戳
+ * @param _img 左目图像
+ * @param _img1 右目图像
+ */
 void Estimator::inputImage(double t, const cv::Mat &_img, const cv::Mat &_img1)
 {
     inputImageCnt++;
@@ -164,18 +175,18 @@ void Estimator::inputImage(double t, const cv::Mat &_img, const cv::Mat &_img1)
     TicToc featureTrackerTime;
 
     if(_img1.empty())
-        featureFrame = featureTracker.trackImage(t, _img);
+        featureFrame = featureTracker.trackImage(t, _img);          // 单目跟踪
     else
-        featureFrame = featureTracker.trackImage(t, _img, _img1);
+        featureFrame = featureTracker.trackImage(t, _img, _img1);   // 双目跟踪
     //printf("featureTracker time: %f\n", featureTrackerTime.toc());
 
-    if (SHOW_TRACK)
+    if (SHOW_TRACK) // 发布跟踪图像数据
     {
         cv::Mat imgTrack = featureTracker.getTrackImage();
         pubTrackImage(imgTrack, t);
     }
     
-    if(MULTIPLE_THREAD)  
+    if(MULTIPLE_THREAD)  // 如果单独开启了处理线程，就直接将跟踪结果放入特征队列中即可
     {     
         if(inputImageCnt % 2 == 0)
         {
@@ -184,7 +195,7 @@ void Estimator::inputImage(double t, const cv::Mat &_img, const cv::Mat &_img1)
             mBuf.unlock();
         }
     }
-    else
+    else // 否则，手动调用函数进行处理
     {
         mBuf.lock();
         featureBuf.push(make_pair(t, featureFrame));
@@ -204,6 +215,7 @@ void Estimator::inputIMU(double t, const Vector3d &linearAcceleration, const Vec
     //printf("input imu with time %f \n", t);
     mBuf.unlock();
 
+    // 初始化完成后，再发布相关的里程数据
     if (solver_flag == NON_LINEAR)
     {
         mPropagate.lock();
@@ -219,6 +231,7 @@ void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Ma
     featureBuf.push(make_pair(t, featureFrame));
     mBuf.unlock();
 
+    // 如果没开启处理线程，就手动进行处理
     if(!MULTIPLE_THREAD)
         processMeasurements();
 }
