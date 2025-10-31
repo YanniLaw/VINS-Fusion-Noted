@@ -289,6 +289,7 @@ PinholeCamera::PinholeCamera(const std::string& cameraName,
     }
 
     // Inverse camera projection matrix parameters
+    // 内参矩阵的逆矩阵
     m_inv_K11 = 1.0 / mParameters.fx();
     m_inv_K13 = -mParameters.cx() / mParameters.fx();
     m_inv_K22 = 1.0 / mParameters.fy();
@@ -452,12 +453,12 @@ PinholeCamera::liftProjective(const Eigen::Vector2d& p, Eigen::Vector3d& P) cons
     double mx_d, my_d,mx2_d, mxy_d, my2_d, mx_u, my_u;
     double rho2_d, rho4_d, radDist_d, Dx_d, Dy_d, inv_denom_d;
     //double lambda;
-
+    // K^-1* P 利用内参逆矩阵求得归一化平面的X,Y坐标 
     // Lift points to normalised plane
-    mx_d = m_inv_K11 * p(0) + m_inv_K13;
-    my_d = m_inv_K22 * p(1) + m_inv_K23;
+    mx_d = m_inv_K11 * p(0) + m_inv_K13; // x 
+    my_d = m_inv_K22 * p(1) + m_inv_K23; // y 
 
-    if (m_noDistortion)
+    if (m_noDistortion) // 没有畸变
     {
         mx_u = mx_d;
         my_u = my_d;
@@ -473,15 +474,16 @@ PinholeCamera::liftProjective(const Eigen::Vector2d& p, Eigen::Vector3d& P) cons
 
             // Apply inverse distortion model
             // proposed by Heikkila
-            mx2_d = mx_d*mx_d;
-            my2_d = my_d*my_d;
-            mxy_d = mx_d*my_d;
-            rho2_d = mx2_d+my2_d;
-            rho4_d = rho2_d*rho2_d;
-            radDist_d = k1*rho2_d+k2*rho4_d;
+            // reference https://www.tjhsst.edu/~rlatimer/techlab03/eherbst03/heikkila_article.pdf
+            mx2_d = mx_d*mx_d; // x^2 
+            my2_d = my_d*my_d; // y^2 
+            mxy_d = mx_d*my_d; // x*y
+            rho2_d = mx2_d+my2_d;               // r^2 = x^2 + y^2
+            rho4_d = rho2_d*rho2_d;             // r^4
+            radDist_d = k1*rho2_d+k2*rho4_d;    // k1*r^2 + k2*r^4
             Dx_d = mx_d*radDist_d + p2*(rho2_d+2*mx2_d) + 2*p1*mxy_d;
             Dy_d = my_d*radDist_d + p1*(rho2_d+2*my2_d) + 2*p2*mxy_d;
-            inv_denom_d = 1/(1+4*k1*rho2_d+6*k2*rho4_d+8*p1*my_d+8*p2*mx_d);
+            inv_denom_d = 1/(1+4*k1*rho2_d+6*k2*rho4_d+8*p1*my_d+8*p2*mx_d); // 局部Jacobian补偿
 
             mx_u = mx_d - inv_denom_d*Dx_d;
             my_u = my_d - inv_denom_d*Dy_d;
