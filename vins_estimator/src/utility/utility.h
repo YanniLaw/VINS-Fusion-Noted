@@ -72,6 +72,7 @@ class Utility
         return ans;
     }
 
+    // 旋转矩阵转化为欧拉角(deg)
     static Eigen::Vector3d R2ypr(const Eigen::Matrix3d &R)
     {
         Eigen::Vector3d n = R.col(0);

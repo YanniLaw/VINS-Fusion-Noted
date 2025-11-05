@@ -35,6 +35,7 @@ void FeatureManager::clearState()
     feature.clear();
 }
 
+//窗口中被多帧跟踪到过的特征的数量
 int FeatureManager::getFeatureCount()
 {
     int cnt = 0;
@@ -49,40 +50,46 @@ int FeatureManager::getFeatureCount()
     return cnt;
 }
 
-
+/**
+ * @brief   选择关键帧的策略。只有关键帧才会被加入到滑窗内
+ * @param[in]   frame_count：当前帧在滑动窗口中的id，从0开始
+ * @param[in]   image：当前帧图像特征点的信息(feature_id, [camera_id, [x,y,z,u,v,vx,vy]])所构成的map，索引为feature_id
+ * @param[in]   td：IMU和cam同步时间差
+ * @return  bool true：次新帧是关键帧；false：次新帧是非关键帧
+*/
 bool FeatureManager::addFeatureCheckParallax(int frame_count, const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, double td)
 {
     ROS_DEBUG("input feature: %d", (int)image.size());
     ROS_DEBUG("num of feature: %d", getFeatureCount());
     double parallax_sum = 0;
     int parallax_num = 0;
-    last_track_num = 0;
+    last_track_num = 0;         // 统计当前帧图像中跟踪到的已经存在特征点容器中的特征点数量
     last_average_parallax = 0;
-    new_feature_num = 0;
-    long_track_num = 0;
+    new_feature_num = 0;        // 统计当前帧图像数据中新增加的特征点数量
+    long_track_num = 0;         // 统计当前帧中长时间跟随的特征点数量
     for (auto &id_pts : image)
     {
         FeaturePerFrame f_per_fra(id_pts.second[0].second, td);
-        assert(id_pts.second[0].first == 0);
-        if(id_pts.second.size() == 2)
+        assert(id_pts.second[0].first == 0); // 左目的canera_id 为0 
+        if(id_pts.second.size() == 2) // 双目模式
         {
             f_per_fra.rightObservation(id_pts.second[1].second);
-            assert(id_pts.second[1].first == 1);
+            assert(id_pts.second[1].first == 1); // 右目的canera_id 为1
         }
-
+        // 根据feature_id判断在feature容器中是否已有该路标点
         int feature_id = id_pts.first;
         auto it = find_if(feature.begin(), feature.end(), [feature_id](const FeaturePerId &it)
                           {
             return it.feature_id == feature_id;
                           });
 
-        if (it == feature.end())
+        if (it == feature.end()) // 如果没有则新建一个
         {
-            feature.push_back(FeaturePerId(feature_id, frame_count));
+            feature.push_back(FeaturePerId(feature_id, frame_count)); // 注意，这里传入的是frame_count，表示当前帧在滑动窗口中的id
             feature.back().feature_per_frame.push_back(f_per_fra);
             new_feature_num++;
         }
-        else if (it->feature_id == feature_id)
+        else if (it->feature_id == feature_id) // 已经有了该特征点
         {
             it->feature_per_frame.push_back(f_per_fra);
             last_track_num++;
@@ -91,17 +98,22 @@ bool FeatureManager::addFeatureCheckParallax(int frame_count, const map<int, vec
         }
     }
 
+    // 如果当前图像帧跟踪匹配到的路标点的个数不足20，则将次新帧作为关键帧（关键帧是场景中具有代表性的帧）
+    // 出现这种情况可能是当前帧移动较大或者存在遮挡，则次新帧要作为关键帧，否则可能会漏掉某个场景
+    // 或者长时间跟踪到的特征点数量小于40个
+    // 或者新增加的特征点数量大于跟踪到的特征点数量的一半
     //if (frame_count < 2 || last_track_num < 20)
     //if (frame_count < 2 || last_track_num < 20 || new_feature_num > 0.5 * last_track_num)
     if (frame_count < 2 || last_track_num < 20 || long_track_num < 40 || new_feature_num > 0.5 * last_track_num)
         return true;
 
-    for (auto &it_per_id : feature)
+    for (auto &it_per_id : feature) // 特征点容器中的每一个特征点数据
     {
+        // 该路标点的起始帧在是次新帧以前，且该路标点至少要被次次新帧和次新帧跟踪观测到过(同时在 frame_count-2 和 frame_count-1 都出现的特征（即连续两帧都有观测的特征）)
         if (it_per_id.start_frame <= frame_count - 2 &&
             it_per_id.start_frame + int(it_per_id.feature_per_frame.size()) - 1 >= frame_count - 1)
         {
-            parallax_sum += compensatedParallax2(it_per_id, frame_count);
+            parallax_sum += compensatedParallax2(it_per_id, frame_count); // 计算该路标点在次次新帧和次新帧的观测数据的视差量
             parallax_num++;
         }
     }
@@ -528,15 +540,17 @@ void FeatureManager::removeFront(int frame_count)
     }
 }
 
+// 计算某个路标点it_per_id，在次次新帧和次新帧的观测数据的视差量
+// frame_count为当前帧在滑动窗口中的id
 double FeatureManager::compensatedParallax2(const FeaturePerId &it_per_id, int frame_count)
 {
     //check the second last frame is keyframe or not
     //parallax betwwen seconde last frame and third last frame
-    const FeaturePerFrame &frame_i = it_per_id.feature_per_frame[frame_count - 2 - it_per_id.start_frame];
-    const FeaturePerFrame &frame_j = it_per_id.feature_per_frame[frame_count - 1 - it_per_id.start_frame];
+    const FeaturePerFrame &frame_i = it_per_id.feature_per_frame[frame_count - 2 - it_per_id.start_frame]; // 次次新帧
+    const FeaturePerFrame &frame_j = it_per_id.feature_per_frame[frame_count - 1 - it_per_id.start_frame]; // 次新帧
 
     double ans = 0;
-    Vector3d p_j = frame_j.point;
+    Vector3d p_j = frame_j.point; // 相机归一化平面坐标
 
     double u_j = p_j(0);
     double v_j = p_j(1);

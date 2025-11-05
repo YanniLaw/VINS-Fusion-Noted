@@ -25,6 +25,7 @@ using namespace Eigen;
 #include "parameters.h"
 #include "../utility/tic_toc.h"
 
+// 每个路标点在一个图像帧中的观测信息
 class FeaturePerFrame
 {
   public:
@@ -51,21 +52,22 @@ class FeaturePerFrame
         velocityRight.y() = _point(6); 
         is_stereo = true;
     }
-    double cur_td;
-    Vector3d point, pointRight;
-    Vector2d uv, uvRight;
-    Vector2d velocity, velocityRight;
-    bool is_stereo;
+    double cur_td; // 真实采样时刻的特征位置所对应的imu-camera的同步时钟偏差
+    Vector3d point, pointRight; // 该路标点在该帧相机坐标系下的去畸变后的相机归一化平面坐标
+    Vector2d uv, uvRight;       // 该路标点在该帧上的有畸变的原始像素坐标
+    Vector2d velocity, velocityRight; // 该路标点在该帧相机归一化平面上的速度
+    bool is_stereo; // 是否是双目模式
 };
 
+// 管理一个路标点的信息
 class FeaturePerId
 {
   public:
-    const int feature_id;
-    int start_frame;
-    vector<FeaturePerFrame> feature_per_frame;
+    const int feature_id; // 该路标点的全局索引id
+    int start_frame;      // 观测到该路标点的起始帧（主导帧）在滑动窗口中的id
+    vector<FeaturePerFrame> feature_per_frame; //一个路标点会被多个连续的图像帧观测到，因此这里采用vector来记录该路标点的在每个帧下的观测信息
     int used_num;
-    double estimated_depth;
+    double estimated_depth; // 该路标点在start_frame帧下的深度
     int solve_flag; // 0 haven't solve yet; 1 solve succ; 2 solve fail;
 
     FeaturePerId(int _feature_id, int _start_frame)
@@ -102,7 +104,7 @@ class FeatureManager
     void removeBack();
     void removeFront(int frame_count);
     void removeOutlier(set<int> &outlierIndex);
-    list<FeaturePerId> feature;
+    list<FeaturePerId> feature; // 管理整个滑动窗口中所有的路标点信息
     int last_track_num;
     double last_average_parallax;
     int new_feature_num;

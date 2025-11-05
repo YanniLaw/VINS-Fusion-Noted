@@ -228,7 +228,7 @@ map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> FeatureTracker::trackIm
     }
 
     cur_un_pts = undistortedPts(cur_pts, m_camera[0]); // 计算得到去畸变的归一化坐标
-    pts_velocity = ptsVelocity(ids, cur_un_pts, cur_un_pts_map, prev_un_pts_map); // 计算光流速度
+    pts_velocity = ptsVelocity(ids, cur_un_pts, cur_un_pts_map, prev_un_pts_map); // 计算光流速度(特征点在归一化平面上的速度)
 
     if(!_img1.empty() && stereo_cam) // 双目跟踪
     {
