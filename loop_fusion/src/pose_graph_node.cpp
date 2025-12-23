@@ -296,7 +296,7 @@ void process()
                 continue;
             }
 
-            if (skip_cnt < SKIP_CNT)
+            if (skip_cnt < SKIP_CNT) // 跳帧
             {
                 skip_cnt++;
                 continue;
@@ -305,7 +305,7 @@ void process()
             {
                 skip_cnt = 0;
             }
-
+            // 转换ros图像数据的格式
             cv_bridge::CvImageConstPtr ptr;
             if (image_msg->encoding == "8UC1")
             {
@@ -331,40 +331,41 @@ void process()
                                      pose_msg->pose.pose.orientation.x,
                                      pose_msg->pose.pose.orientation.y,
                                      pose_msg->pose.pose.orientation.z).toRotationMatrix();
-            if((T - last_t).norm() > SKIP_DIS)
+            if((T - last_t).norm() > SKIP_DIS) // 距离挑选 
             {
                 vector<cv::Point3f> point_3d; 
                 vector<cv::Point2f> point_2d_uv; 
                 vector<cv::Point2f> point_2d_normal;
                 vector<double> point_id;
 
-                for (unsigned int i = 0; i < point_msg->points.size(); i++)
+                for (unsigned int i = 0; i < point_msg->points.size(); i++) // 遍历当前帧图像能够观测到的地图点云信息中的所有路标点
                 {
                     cv::Point3f p_3d;
                     p_3d.x = point_msg->points[i].x;
                     p_3d.y = point_msg->points[i].y;
                     p_3d.z = point_msg->points[i].z;
-                    point_3d.push_back(p_3d);
+                    point_3d.push_back(p_3d); // 路标点在vio世界坐标系下的3d坐标
 
                     cv::Point2f p_2d_uv, p_2d_normal;
                     double p_id;
                     p_2d_normal.x = point_msg->channels[i].values[0];
-                    p_2d_normal.y = point_msg->channels[i].values[1];
+                    p_2d_normal.y = point_msg->channels[i].values[1];   // 该路标点在当前帧相机坐标系下的去畸变后的相机归一化平面坐标
                     p_2d_uv.x = point_msg->channels[i].values[2];
-                    p_2d_uv.y = point_msg->channels[i].values[3];
-                    p_id = point_msg->channels[i].values[4];
+                    p_2d_uv.y = point_msg->channels[i].values[3];       // 该路标点在当前帧上的有畸变的原始像素坐标
+                    p_id = point_msg->channels[i].values[4];            // 该路标点的全局索引id
                     point_2d_normal.push_back(p_2d_normal);
                     point_2d_uv.push_back(p_2d_uv);
                     point_id.push_back(p_id);
 
                     //printf("u %f, v %f \n", p_2d_uv.x, p_2d_uv.y);
                 }
-
+                // 由于当前帧图像是vins_estimator中的滑动窗口中的优化完成后的次新关键帧，这可以保证这里的关键帧的位姿基本正确，因为已经过了前面的滑窗优化。
+                // 当然，即使不正确也无所谓，因为会在闭环优化时进行修正
                 KeyFrame* keyframe = new KeyFrame(pose_msg->header.stamp.toSec(), frame_index, T, R, image,
                                    point_3d, point_2d_uv, point_2d_normal, point_id, sequence);   
                 m_process.lock();
                 start_flag = 1;
-                posegraph.addKeyFrame(keyframe, 1);
+                posegraph.addKeyFrame(keyframe, 1); // 将此关键帧添加到位姿图中
                 m_process.unlock();
                 frame_index++;
                 last_t = T;
@@ -482,7 +483,7 @@ int main(int argc, char **argv)
     ros::Subscriber sub_image = n.subscribe(IMAGE_TOPIC, 2000, image_callback);
     ros::Subscriber sub_pose = n.subscribe("/vins_estimator/keyframe_pose", 2000, pose_callback);
     ros::Subscriber sub_extrinsic = n.subscribe("/vins_estimator/extrinsic", 2000, extrinsic_callback);
-    ros::Subscriber sub_point = n.subscribe("/vins_estimator/keyframe_point", 2000, point_callback);
+    ros::Subscriber sub_point = n.subscribe("/vins_estimator/keyframe_point", 2000, point_callback);    // 关键帧对应的特征点云(位于vio坐标系下)
     ros::Subscriber sub_margin_point = n.subscribe("/vins_estimator/margin_cloud", 2000, margin_point_callback);
 
     pub_match_img = n.advertise<sensor_msgs::Image>("match_image", 1000);

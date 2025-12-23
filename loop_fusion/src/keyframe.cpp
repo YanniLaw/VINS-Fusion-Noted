@@ -48,10 +48,10 @@ KeyFrame::KeyFrame(double _time_stamp, int _index, Vector3d &_vio_T_w_i, Matrix3
 	computeWindowBRIEFPoint();
 	computeBRIEFPoint();
 	if(!DEBUG_IMAGE)
-		image.release();
+		image.release(); // 不在位姿图中保存该图像，则将图像释放掉
 }
 
-// load previous keyframe
+// load previous keyframe 保存好的关键帧
 KeyFrame::KeyFrame(double _time_stamp, int _index, Vector3d &_vio_T_w_i, Matrix3d &_vio_R_w_i, Vector3d &_T_w_i, Matrix3d &_R_w_i,
 					cv::Mat &_image, int _loop_index, Eigen::Matrix<double, 8, 1 > &_loop_info,
 					vector<cv::KeyPoint> &_keypoints, vector<cv::KeyPoint> &_keypoints_norm, vector<BRIEF::bitset> &_brief_descriptors)
@@ -82,7 +82,7 @@ KeyFrame::KeyFrame(double _time_stamp, int _index, Vector3d &_vio_T_w_i, Matrix3
 	brief_descriptors = _brief_descriptors;
 }
 
-
+// 计算已有的在滑动窗口中的特征关键点的描述子
 void KeyFrame::computeWindowBRIEFPoint()
 {
 	BriefExtractor extractor(BRIEF_PATTERN_FILE.c_str());
@@ -92,17 +92,42 @@ void KeyFrame::computeWindowBRIEFPoint()
 	    key.pt = point_2d_uv[i];
 	    window_keypoints.push_back(key);
 	}
-	extractor(image, window_keypoints, window_brief_descriptors);
+	// 因为单目VIO能够提供可观测的翻滚roll和俯仰pitch角，旋转可观，匹配过程中对旋转有一定的适应性，所以不需要依赖于类似ORB特征的旋转不变特征，描述子仍然使用BRIEF
+	extractor(image, window_keypoints, window_brief_descriptors); // 自己提供特征点，计算描述子
 }
 
+// 计算原始图像的关键点和描述子信息
+// 由于在前端提取的关键点数量较少，对于闭环检测是不够的；因此对新关键帧图像（即后端非线性优化处理完的关键帧）提取出500个新的特征关键点，并计算关键点的描述子
 void KeyFrame::computeBRIEFPoint()
 {
 	BriefExtractor extractor(BRIEF_PATTERN_FILE.c_str());
 	const int fast_th = 20; // corner detector response threshold
+	/**
+	 * void cv::FAST(
+	 * InputArray image,										输入的灰度图像
+	 * std::vector< KeyPoint >& keypoints,	输出在图像上检测到的关键点
+	 * int threshold,						中心像素的灰度与该像素周围圆的像素之间的差异的阈值
+	 * bool nonmaxSuppression = true 		是否对检测到的角点（关键点）应用非最大抑制，去掉重复或者相邻角点
+	 * int type = FastFeatureDetector::TYPE_9_16  // 检测模板：5_8, 7_12, 9_16
+	 * )
+	*/
 	if(1)
 		cv::FAST(image, keypoints, fast_th, true);
 	else
 	{
+		/**
+		 * void goodFeaturesToTrack(
+		 * InputArray image,				输入图像（8位或32位单通道图）
+		 * OutputArray corners,				检测到的所有角点，类型为vector或数组。如果类型是vector，那么它应是一个cv::Point2f的vector对象；如果类型是cv::Mat，那么它的每一行对应一个角点，点的x、y位置分别是两列
+		 * int maxCorners,					用于限定检测到的角点数的最大值
+		 * double qualityLevel,				表示检测到的角点的质量水平（通常是0.10到0.01之间的数值，不能大于1.0）
+		 * double minDistance,				用于区分相邻两个角点的最小距离（小于这个距离的点将进行合并）
+		 * InputArray mask=noArray(),		如果指定mask，它的维度必须和输入图像一致，且在mask值为0处不进行角点检测
+		 * int blockSize=3,					表示在计算角点时参与运算的区域大小，常用值为3，但是如果图像的分辨率较高则可以考虑使用较大一点的值
+		 * bool useHarrisDetector=false,	指定角点检测的方法，如果是true则使用Harris角点检测，false则使用Shi-Tomasi算法
+		 * double k=0.04					在使用Harris算法时使用，最好使用默认值0.04
+		 * )
+		*/		
 		vector<cv::Point2f> tmp_pts;
 		cv::goodFeaturesToTrack(image, tmp_pts, 500, 0.01, 10);
 		for(int i = 0; i < (int)tmp_pts.size(); i++)
@@ -112,20 +137,16 @@ void KeyFrame::computeBRIEFPoint()
 		    keypoints.push_back(key);
 		}
 	}
-	extractor(image, keypoints, brief_descriptors);
+	extractor(image, keypoints, brief_descriptors); // 计算描述子
 	for (int i = 0; i < (int)keypoints.size(); i++)
 	{
 		Eigen::Vector3d tmp_p;
+		//根据不同的相机模型将角点二维像素坐标转换到相机归一化平面坐标，且进行去畸变处理
 		m_camera->liftProjective(Eigen::Vector2d(keypoints[i].pt.x, keypoints[i].pt.y), tmp_p);
 		cv::KeyPoint tmp_norm;
 		tmp_norm.pt = cv::Point2f(tmp_p.x()/tmp_p.z(), tmp_p.y()/tmp_p.z());
 		keypoints_norm.push_back(tmp_norm);
 	}
-}
-
-void BriefExtractor::operator() (const cv::Mat &im, vector<cv::KeyPoint> &keys, vector<BRIEF::bitset> &descriptors) const
-{
-  m_brief.compute(im, keys, descriptors);
 }
 
 
@@ -582,5 +603,11 @@ BriefExtractor::BriefExtractor(const std::string &pattern_file)
 
   m_brief.importPairs(x1, y1, x2, y2);
 }
+
+void BriefExtractor::operator() (const cv::Mat &im, vector<cv::KeyPoint> &keys, vector<BRIEF::bitset> &descriptors) const
+{
+  m_brief.compute(im, keys, descriptors);
+}
+
 
 

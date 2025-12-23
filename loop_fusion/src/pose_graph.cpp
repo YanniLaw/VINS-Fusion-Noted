@@ -65,12 +65,19 @@ void PoseGraph::loadVocabulary(std::string voc_path)
     db.setVocabulary(*voc, false, 0);
 }
 
+// 在位姿图中添加关键帧，并进行闭环检测等操作
+// 这里进行一些说明：系统在运行了一段时间后，由于累积误差的原因，导致的位姿漂移，因此，当前滑动窗口中的帧和之前的历史帧所在的世界坐标系是有偏差的；
+// 这里假设历史帧所在的原世界坐标系是w1，当前滑动窗口中的帧所在的世界坐标系是w2。
+// 直接从vins_estimator中得到的闭环历史帧（假设为i帧）的位姿为T^w1_bi，而直接从vins_estimator中得到的当前关键帧（当前滑动窗口中的帧，假设为j帧）的位姿为T^w2_bj。
+// 我们的目标就是要将w2修正到w1。
+// 我们再考虑到系统中可能存在有多个图像序列（由于使用加载了历史地图或者由于跟踪丢失而重新初始化等原因造成的），用sequence1，sequence2等表示不同图像序列，
+// 且它们之间的世界坐标系是不同的（例如，以该图像序列的起始帧做为世界坐标系）；如果没有特别的标注，则默认是在同一个图像序列的世界坐标系
 void PoseGraph::addKeyFrame(KeyFrame* cur_kf, bool flag_detect_loop)
 {
     //shift to base frame
     Vector3d vio_P_cur;
     Matrix3d vio_R_cur;
-    if (sequence_cnt != cur_kf->sequence)
+    if (sequence_cnt != cur_kf->sequence) // 判断当前帧是否属于一个新序列（例如重启、重新初始化后的轨迹）
     {
         sequence_cnt++;
         sequence_loop.push_back(0);
@@ -78,27 +85,27 @@ void PoseGraph::addKeyFrame(KeyFrame* cur_kf, bool flag_detect_loop)
         w_r_vio = Eigen::Matrix3d::Identity();
         m_drift.lock();
         t_drift = Eigen::Vector3d(0, 0, 0);
-        r_drift = Eigen::Matrix3d::Identity();
+        r_drift = Eigen::Matrix3d::Identity(); // 重置新图像序列中的相应变量
         m_drift.unlock();
     }
     
-    cur_kf->getVioPose(vio_P_cur, vio_R_cur);
+    cur_kf->getVioPose(vio_P_cur, vio_R_cur);   // 当前关键帧的vio世界位姿
     vio_P_cur = w_r_vio * vio_P_cur + w_t_vio;
-    vio_R_cur = w_r_vio *  vio_R_cur;
+    vio_R_cur = w_r_vio *  vio_R_cur;           // 转换到global坐标系世界位姿
     cur_kf->updateVioPose(vio_P_cur, vio_R_cur);
-    cur_kf->index = global_index;
+    cur_kf->index = global_index; //构造关键帧的时候不是已经设置了嘛？
     global_index++;
 	int loop_index = -1;
     if (flag_detect_loop)
     {
         TicToc tmp_t;
-        loop_index = detectLoop(cur_kf, cur_kf->index);
+        loop_index = detectLoop(cur_kf, cur_kf->index); // 当前关键帧的闭环检测函数，返回最佳闭环候选历史帧的索引index
     }
     else
     {
-        addKeyFrameIntoVoc(cur_kf);
+        addKeyFrameIntoVoc(cur_kf); // 将当前关键帧加入到词典当中
     }
-	if (loop_index != -1)
+	if (loop_index != -1) // 检测到了闭环候选帧
 	{
         //printf(" %d detect loop with %d \n", cur_kf->index, loop_index);
         KeyFrame* old_kf = getKeyFrame(loop_index);
@@ -332,14 +339,31 @@ KeyFrame* PoseGraph::getKeyFrame(int index)
         return NULL;
 }
 
+// 对当前关键帧（当前滑动窗口中的帧）keyframe进行回环检测；在初步检测到的所有候选关键帧中，选取最小索引的关键帧作为最佳闭环候选帧，并返回该候选帧的index，
+// 如果找不到的话，则返回-1，表示没有检测到闭环
+// frame_index：该关键帧的全局索引id
 int PoseGraph::detectLoop(KeyFrame* keyframe, int frame_index)
 {
     // put image into image_pool; for visualization
     cv::Mat compressed_image;
-    if (DEBUG_IMAGE)
+    if (DEBUG_IMAGE) // 将当前关键帧的图像存入位姿图中进行可视化处理
     {
         int feature_num = keyframe->keypoints.size();
         cv::resize(keyframe->image, compressed_image, cv::Size(376, 240));
+        /**
+         * putText函数将指定的text信息画在图像中指定的位置
+         * void putText(
+         * Mat& img,                    图像信息
+         * const string& text,          文字信息
+         * Point org,                   Bottom-left corner of the text string in the image
+         * int fontFace,                字体
+         * double fontScale,            文字大小
+         * Scalar color,                颜色
+         * int thickness=1,             文字的线条粗细
+         * int lineType=8,
+         * bool bottomLeftOrigin=false
+         * )
+        */
         putText(compressed_image, "feature_num:" + to_string(feature_num), cv::Point2f(10, 10), CV_FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255));
         image_pool[frame_index] = compressed_image;
     }
@@ -347,12 +371,14 @@ int PoseGraph::detectLoop(KeyFrame* keyframe, int frame_index)
     //first query; then add this frame into database!
     QueryResults ret;
     TicToc t_query;
+    // 在字典数据库中查询当前关键帧，得到其与数据库中的每一历史帧的相似度评分，并将查询结果存入ret中
+    // 参数中的4表示返回前4个结果；frame_index - 50表示要查询的历史帧的最大index，这说明查询的是当前关键帧的前50帧的再之前的帧
     db.query(keyframe->brief_descriptors, ret, 4, frame_index - 50);
     //printf("query time: %f", t_query.toc());
     //cout << "Searching for Image " << frame_index << ". " << ret << endl;
 
     TicToc t_add;
-    db.add(keyframe->brief_descriptors);
+    db.add(keyframe->brief_descriptors); // 将当前关键帧添加到字典数据库中
     //printf("add feature time: %f", t_add.toc());
     // ret[0] is the nearest neighbour's score. threshold change with neighour score
     bool find_loop = false;
@@ -401,15 +427,16 @@ int PoseGraph::detectLoop(KeyFrame* keyframe, int frame_index)
         cv::waitKey(20);
     }
 */
+    // 相似度评分要大于0.015，且当前关键帧的全局索引id要大于50才考虑进行回环，说明最初始的前50帧不做闭环判断。系统运行的时间较短，帧也比较少，没必要检测闭环
     if (find_loop && frame_index > 50)
     {
         int min_index = -1;
         for (unsigned int i = 0; i < ret.size(); i++)
         {
             if (min_index == -1 || (ret[i].Id < min_index && ret[i].Score > 0.015))
-                min_index = ret[i].Id;
+                min_index = ret[i].Id; // 在所有的候选帧中，找出最小索引的那一帧。说明得到的是间隔当前关键帧时间最久远的那一帧
         }
-        return min_index;
+        return min_index; // 为什么不找最相似，或者距离最近的？？？
     }
     else
         return -1;

@@ -85,7 +85,7 @@ private:
 	int global_index;
 	int sequence_cnt;
 	vector<bool> sequence_loop;
-	map<int, cv::Mat> image_pool;
+	map<int, cv::Mat> image_pool; // image id - compressed image
 	int earliest_loop_index;
 	int base_sequence;
 	bool use_imu;
