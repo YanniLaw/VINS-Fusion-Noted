@@ -63,17 +63,17 @@ public:
     cv::Mat imTrack;
     cv::Mat mask;
     cv::Mat fisheye_mask;
-    cv::Mat prev_img, cur_img;
-    vector<cv::Point2f> n_pts;
-    vector<cv::Point2f> predict_pts;
+    cv::Mat prev_img, cur_img; // 当前帧和上一帧图像
+    vector<cv::Point2f> n_pts; // 新检测到的特征点
+    vector<cv::Point2f> predict_pts; // 预测的特征点位置
     vector<cv::Point2f> predict_pts_debug;
-    vector<cv::Point2f> prev_pts, cur_pts, cur_right_pts; // 跟踪到的特征点(跟踪时间越久越靠前)
-    vector<cv::Point2f> prev_un_pts, cur_un_pts, cur_un_right_pts;
-    vector<cv::Point2f> pts_velocity, right_pts_velocity;
-    vector<int> ids, ids_right; // 跟踪到的特征点id(跟踪时间越久越靠前)
-    vector<int> track_cnt;      // 跟踪到的特征点跟踪时长(跟踪时间越久越靠前)
-    map<int, cv::Point2f> cur_un_pts_map, prev_un_pts_map; // 特征点id - 去畸变归一化坐标  键值对容器
-    map<int, cv::Point2f> cur_un_right_pts_map, prev_un_right_pts_map;
+    vector<cv::Point2f> prev_pts, cur_pts, cur_right_pts; // 上一帧/当前帧/当前帧右目 跟踪到的原始特征点(跟踪时间越久越靠前)
+    vector<cv::Point2f> prev_un_pts, cur_un_pts, cur_un_right_pts; // 上一帧/当前帧/当前帧右目 跟踪到的去畸变归一化坐标特征点(跟踪时间越久越靠前)
+    vector<cv::Point2f> pts_velocity, right_pts_velocity; // 当前帧 左目/右目 光流跟踪速度((特征点在归一化平面上的速度))
+    vector<int> ids, ids_right; // 当前帧左目/右目 跟踪到的特征点id(跟踪时间越久越靠前)
+    vector<int> track_cnt;      // 当前帧跟踪到的特征点跟踪时长(跟踪时间越久越靠前)
+    map<int, cv::Point2f> cur_un_pts_map, prev_un_pts_map; // 当前帧 / 上一帧的 (特征点id,去畸变归一化坐标) 键值对容器
+    map<int, cv::Point2f> cur_un_right_pts_map, prev_un_right_pts_map; // 当前帧 / 上一帧 右目的 (特征点id,去畸变归一化坐标) 键值对容器
     map<int, cv::Point2f> prevLeftPtsMap; // 上一帧左目 特征点id-去畸变归一化坐标 键值对容器
     vector<camodocal::CameraPtr> m_camera;
     double cur_time;

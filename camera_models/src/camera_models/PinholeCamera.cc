@@ -453,7 +453,7 @@ PinholeCamera::liftProjective(const Eigen::Vector2d& p, Eigen::Vector3d& P) cons
     double mx_d, my_d,mx2_d, mxy_d, my2_d, mx_u, my_u;
     double rho2_d, rho4_d, radDist_d, Dx_d, Dy_d, inv_denom_d;
     //double lambda;
-    // K^-1* P 利用内参逆矩阵求得归一化平面的X,Y坐标 
+    // K^-1* P 利用内参逆矩阵求得归一化平面的X,Y坐标 (带畸变)
     // Lift points to normalised plane
     mx_d = m_inv_K11 * p(0) + m_inv_K13; // x 
     my_d = m_inv_K22 * p(1) + m_inv_K23; // y 
@@ -493,16 +493,22 @@ PinholeCamera::liftProjective(const Eigen::Vector2d& p, Eigen::Vector3d& P) cons
             // Recursive distortion model
             int n = 8;
             Eigen::Vector2d d_u;
-            distortion(Eigen::Vector2d(mx_d, my_d), d_u);
+            distortion(Eigen::Vector2d(mx_d, my_d), d_u); // 首先将原始的带有畸变的坐标当作为去除畸变后的坐标，来计算畸变量d_u
+            // 由于越靠近中心，畸变量越小；越远离中心，畸变量越大。因此，这里以带有畸变的坐标计算出来的畸变量，肯定会比以实际真实的去除畸变后的坐标计算出来的畸变量d_u0更大
+            // 无畸变mx_u + 畸变量du = 有畸变mx_d
             // Approximate value
             mx_u = mx_d - d_u(0);
-            my_u = my_d - d_u(1);
-
-            for (int i = 1; i < n; ++i)
+            my_u = my_d - d_u(1); // 这里算出来的初始坐标要比实际真实的去除畸变后的坐标更靠近中心
+            // 这种方式加速了去畸变过程，比openCV中的方法快了不少
+            for (int i = 1; i < n; ++i) // 多次迭代去畸变，使结果逼近真值
             {
                 distortion(Eigen::Vector2d(mx_u, my_u), d_u);
+                // 首轮迭代时，因为初始坐标值要比实际真实的去除畸变后的坐标更靠近中心，因此以这个初始值计算得到的畸变量d_u1会比真实的畸变量d_u0更小
+                // 因此，通过下面这个式子计算出的坐标，相对于初始坐标值来说，会朝着实际真实的去除畸变坐标更近一步，然后再以这个坐标进行求解计算得到畸变量d_u2，
+                // 因为距离真实坐标更近一步就意味着远离中心一步，因此d_u2肯定大于d_u1但小于d_u0。再通过下式就能得到一个更靠近真实值的结果，依此迭代。
                 mx_u = mx_d - d_u(0);
                 my_u = my_d - d_u(1);
+                // 当mx_u、my_u等于实际真实的去除畸变坐标时，后面再迭代算出来的d_u，以及mx_u、my_u将不再变化。因此，应该可以加个判断，提前退出该循环？？？
             }
         }
     }
