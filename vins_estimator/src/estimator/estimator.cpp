@@ -250,11 +250,14 @@ bool Estimator::getIMUInterval(double t0, double t1, vector<pair<double, Eigen::
     // 确保接收到的最新的imu时间比image时间新
     if(t1 <= accBuf.back().first)
     {
+        // 丢弃早于/等于 t0 的 IMU（对齐区间起点）
+        // 注意这里是 <= ，因为 t0 对应的 IMU 数据已经被上一帧图像插值处理过了
         while (accBuf.front().first <= t0)
         {
             accBuf.pop();
             gyrBuf.pop();
         }
+        // 收集 (t0, t1) 开区间内的所有 IMU 测量值
         while (accBuf.front().first < t1)
         {
             accVector.push_back(accBuf.front());
@@ -262,6 +265,7 @@ bool Estimator::getIMUInterval(double t0, double t1, vector<pair<double, Eigen::
             gyrVector.push_back(gyrBuf.front());
             gyrBuf.pop();
         }
+        // 让输出数据序列至少包含一个跨过 t1 的样本，以便预积分实现做末端对齐(插值)
         accVector.push_back(accBuf.front());
         gyrVector.push_back(gyrBuf.front());
     }
@@ -288,6 +292,11 @@ void Estimator::processMeasurements()
         //printf("process measurments\n");
         pair<double, map<int, vector<pair<int, Eigen::Matrix<double, 7, 1> > > > > feature;
         vector<pair<double, Eigen::Vector3d>> accVector, gyrVector;
+        // featureBuf是pair<double, map<int, vector<pair<int, Eigen::Matrix<double, 7, 1> > > > >
+        // 第一个double是图像时间戳，第二个map是特征点数据(应该叫TimedFeature更合适些)
+        // 即 map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> featureFrame;
+        // 特征点id - 左右双目特征数据的 关联容器
+        // 特征数据格式: (相机id, [x,y,z,p_u,p_v,velocity_x,velocity_y])
         if(!featureBuf.empty())
         {
             feature = featureBuf.front();
@@ -356,7 +365,7 @@ void Estimator::processMeasurements()
     }
 }
 
-
+// IMU静止初始化(需要先检查是否为静止)
 void Estimator::initFirstIMUPose(vector<pair<double, Eigen::Vector3d>> &accVector)
 {
     printf("init first imu pose\n");
@@ -368,11 +377,11 @@ void Estimator::initFirstIMUPose(vector<pair<double, Eigen::Vector3d>> &accVecto
     {
         averAcc = averAcc + accVector[i].second;
     }
-    averAcc = averAcc / n;
+    averAcc = averAcc / n; // 均值(需要保持静止)
     printf("averge acc %f %f %f\n", averAcc.x(), averAcc.y(), averAcc.z());
     Matrix3d R0 = Utility::g2R(averAcc);
     double yaw = Utility::R2ypr(R0).x();
-    R0 = Utility::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0;
+    R0 = Utility::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0; // 静止初始化的yaw设置为0
     Rs[0] = R0;
     cout << "init R0 " << endl << Rs[0] << endl;
     //Vs[0] = Vector3d(5, 0, 0);

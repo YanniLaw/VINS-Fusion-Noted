@@ -9,6 +9,7 @@
 
 #include "utility.h"
 
+// 用一段时间内的加速度均值（近似“重力方向”）来估计初始姿态的 roll/pitch，并把 yaw（航向）固定为 0
 Eigen::Matrix3d Utility::g2R(const Eigen::Vector3d &g)
 {
     Eigen::Matrix3d R0;
