@@ -55,69 +55,77 @@ int FeatureManager::getFeatureCount()
  * @param[in]   frame_count：当前帧在滑动窗口中的id，从0开始
  * @param[in]   image：当前帧图像特征点的信息(feature_id, [camera_id, [x,y,z,u,v,vx,vy]])所构成的map，索引为feature_id
  * @param[in]   td：IMU和cam同步时间差
- * @return  bool true：次新帧是关键帧；false：次新帧是非关键帧
+ * @return  bool true：边缘化最老帧；false：边缘化次新帧
 */
 bool FeatureManager::addFeatureCheckParallax(int frame_count, const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, double td)
 {
-    ROS_DEBUG("input feature: %d", (int)image.size());
-    ROS_DEBUG("num of feature: %d", getFeatureCount());
+    ROS_DEBUG("input feature: %d", (int)image.size());  // image.size() 是当前帧图像中跟踪到的特征点数量
+    ROS_DEBUG("num of feature: %d", getFeatureCount()); // 滑动窗口中的特征点数量(被多帧跟踪到过)
     double parallax_sum = 0;
     int parallax_num = 0;
-    last_track_num = 0;         // 统计当前帧图像中跟踪到的已经存在特征点容器中的特征点数量
+    last_track_num = 0;         // 统计当前帧图像中跟踪到的已经存在特征点列表中的特征点(旧点)数量
     last_average_parallax = 0;
-    new_feature_num = 0;        // 统计当前帧图像数据中新增加的特征点数量
-    long_track_num = 0;         // 统计当前帧中长时间跟随的特征点数量
-    for (auto &id_pts : image)
+    new_feature_num = 0;        // 统计当前帧图像数据中新增加的特征点数量(新点,此前没有在特征点列表中)
+    long_track_num = 0;         // 统计当前帧中长时间跟随的特征点(旧点)数量
+    // 遍历当前帧图像中每一个特征点的数据
+    for (auto &id_pts : image) 
     {
-        FeaturePerFrame f_per_fra(id_pts.second[0].second, td);
+        // 这里id_pts的结构是std::pair<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>> 即 feature_id - 特征点数据对数组
+        // vector<pair<int, Eigen::Matrix<double, 7, 1>>> 是一个特征点在不同相机下的观测数据对(相机id, 特征数据)数组
+        FeaturePerFrame f_per_fra(id_pts.second[0].second, td); // id_pts.second[0].second其实就是特征点数据Eigen::Matrix<double, 7, 1>
         assert(id_pts.second[0].first == 0); // 左目的canera_id 为0 
         if(id_pts.second.size() == 2) // 双目模式
         {
             f_per_fra.rightObservation(id_pts.second[1].second);
             assert(id_pts.second[1].first == 1); // 右目的canera_id 为1
         }
-        // 根据feature_id判断在feature容器中是否已有该路标点
+        // 根据feature_id判断在feature列表中是否已有该特征点
         int feature_id = id_pts.first;
         auto it = find_if(feature.begin(), feature.end(), [feature_id](const FeaturePerId &it)
                           {
             return it.feature_id == feature_id;
                           });
 
-        if (it == feature.end()) // 如果没有则新建一个
+        if (it == feature.end()) // 如果没有则说明是新点，新建一个FeaturePerId并添加到feature列表中
         {
             feature.push_back(FeaturePerId(feature_id, frame_count)); // 注意，这里传入的是frame_count，表示当前帧在滑动窗口中的id
             feature.back().feature_per_frame.push_back(f_per_fra);
-            new_feature_num++;
+            new_feature_num++; // 统计新点数量
         }
-        else if (it->feature_id == feature_id) // 已经有了该特征点
+        else if (it->feature_id == feature_id) // 已经有了说明该特征点是旧点，直接添加该帧的观测数据
         {
             it->feature_per_frame.push_back(f_per_fra);
-            last_track_num++;
-            if( it-> feature_per_frame.size() >= 4)
-                long_track_num++;
+            last_track_num++;   // 统计旧点数量
+            if( it-> feature_per_frame.size() >= 4) // 如果这个点已经被连续跟踪超过 4 帧，算作“稳定长特征”
+                long_track_num++; // 统计长时间跟踪的旧点数量
         }
     }
-
+    // 在以下情况下，应该把当前帧当作关键帧/需要更新: 
+    // 1. 系统刚启动时，直接将前两帧图像作为关键帧
+    // 2. 跟踪到的旧特征点数量较少(可能运动大、遮挡多、纹理差)
+    // 3. 长时间跟踪到的旧特征点数量较少（稳定性不足）
+    // 4. 新增点占比太高（意味着场景/视角变化大或跟踪在大量丢失）
+    // 核心思想：当跟踪质量变差，或者画面发生剧变时，不要管视差够不够了，必须插入关键帧，否则系统会跟丢。
     // 如果当前图像帧跟踪匹配到的路标点的个数不足20，则将次新帧作为关键帧（关键帧是场景中具有代表性的帧）
     // 出现这种情况可能是当前帧移动较大或者存在遮挡，则次新帧要作为关键帧，否则可能会漏掉某个场景
-    // 或者长时间跟踪到的特征点数量小于40个
-    // 或者新增加的特征点数量大于跟踪到的特征点数量的一半
-    //if (frame_count < 2 || last_track_num < 20)
+    //if (frame_count < 2 || last_track_num < 20) // vins-mono 原始条件
     //if (frame_count < 2 || last_track_num < 20 || new_feature_num > 0.5 * last_track_num)
     if (frame_count < 2 || last_track_num < 20 || long_track_num < 40 || new_feature_num > 0.5 * last_track_num)
         return true;
-
-    for (auto &it_per_id : feature) // 特征点容器中的每一个特征点数据
+    // 当前帧跟踪到的旧特征点数量较多(跟踪良好)，则用另外的条件来进行判断
+    for (auto &it_per_id : feature) // 遍历特征点列表中的每一个特征点数据FeaturePerId
     {
-        // 该路标点的起始帧在是次新帧以前，且该路标点至少要被次次新帧和次新帧跟踪观测到过(同时在 frame_count-2 和 frame_count-1 都出现的特征（即连续两帧都有观测的特征）)
+        // 该路标点的起始帧在是次新帧以前，且该路标点至少要被次次新帧和次新帧跟踪观测到过
+        // (同时在 frame_count-2 和 frame_count-1 都出现的特征（即连续两帧都跟踪到了这个特征点，因为后面要去计算他们的视差）)
+        // 平均视差要在“连续跟踪成功的同一批点”上统计才有意义
         if (it_per_id.start_frame <= frame_count - 2 &&
             it_per_id.start_frame + int(it_per_id.feature_per_frame.size()) - 1 >= frame_count - 1)
         {
-            parallax_sum += compensatedParallax2(it_per_id, frame_count); // 计算该路标点在次次新帧和次新帧的观测数据的视差量
+            parallax_sum += compensatedParallax2(it_per_id, frame_count); // 计算该路标点在次次新帧和次新帧的观测数据的视差量(上一帧和上上帧之间的视差)
             parallax_num++;
         }
     }
-
+    // 没有任何点满足“连续两帧都有观测”的条件，就没法算可靠平均视差，此时返回 true 相当于“保守策略：把它当作关键帧/触发更新”
     if (parallax_num == 0)
     {
         return true;
@@ -126,22 +134,25 @@ bool FeatureManager::addFeatureCheckParallax(int frame_count, const map<int, vec
     {
         ROS_DEBUG("parallax_sum: %lf, parallax_num: %d", parallax_sum, parallax_num);
         ROS_DEBUG("current parallax: %lf", parallax_sum / parallax_num * FOCAL_LENGTH);
-        last_average_parallax = parallax_sum / parallax_num * FOCAL_LENGTH;
+        last_average_parallax = parallax_sum / parallax_num * FOCAL_LENGTH; // 像素为单位的平均视差, 乘 FOCAL_LENGTH（像素单位焦距）后变成大致“像素级视差”
+        // 视差足够大 → 基线足够 → 三角化/约束更强 → 值得把当前帧作为关键帧（或至少触发一次优化）
+        // 视差太小 → 相机几乎没平移（或主要是旋转）→ 加入新关键帧价值有限，可能跳过或延迟
         return parallax_sum / parallax_num >= MIN_PARALLAX;
     }
 }
 
+// 在 FeatureManager 当前维护的所有特征点中，筛出那些同时在两帧 frame_count_l 与 frame_count_r 都有观测的特征，并返回它们在两帧的归一化平面坐标
 vector<pair<Vector3d, Vector3d>> FeatureManager::getCorresponding(int frame_count_l, int frame_count_r)
 {
     vector<pair<Vector3d, Vector3d>> corres;
     for (auto &it : feature)
     {
-        if (it.start_frame <= frame_count_l && it.endFrame() >= frame_count_r)
+        if (it.start_frame <= frame_count_l && it.endFrame() >= frame_count_r) // 该特征点在两帧中都有观测
         {
             Vector3d a = Vector3d::Zero(), b = Vector3d::Zero();
-            int idx_l = frame_count_l - it.start_frame;
+            int idx_l = frame_count_l - it.start_frame; // 索引换算
             int idx_r = frame_count_r - it.start_frame;
-
+            // feature_per_frame 是一个局部 vector，它存的第一帧对应的是系统的 start_frame
             a = it.feature_per_frame[idx_l].point;
 
             b = it.feature_per_frame[idx_r].point;
@@ -546,18 +557,18 @@ double FeatureManager::compensatedParallax2(const FeaturePerId &it_per_id, int f
 {
     //check the second last frame is keyframe or not
     //parallax betwwen seconde last frame and third last frame
-    const FeaturePerFrame &frame_i = it_per_id.feature_per_frame[frame_count - 2 - it_per_id.start_frame]; // 次次新帧
-    const FeaturePerFrame &frame_j = it_per_id.feature_per_frame[frame_count - 1 - it_per_id.start_frame]; // 次新帧
+    const FeaturePerFrame &frame_i = it_per_id.feature_per_frame[frame_count - 2 - it_per_id.start_frame]; // 次次新帧(上上帧)
+    const FeaturePerFrame &frame_j = it_per_id.feature_per_frame[frame_count - 1 - it_per_id.start_frame]; // 次新帧(上一帧)
 
     double ans = 0;
-    Vector3d p_j = frame_j.point; // 相机归一化平面坐标
+    Vector3d p_j = frame_j.point; // 该路标点在该帧相机坐标系下的去畸变后的相机归一化平面坐标
 
     double u_j = p_j(0);
     double v_j = p_j(1);
 
     Vector3d p_i = frame_i.point;
     Vector3d p_i_comp;
-
+    // 旋转平移补偿
     //int r_i = frame_count - 2;
     //int r_j = frame_count - 1;
     //p_i_comp = ric[camera_id_j].transpose() * Rs[r_j].transpose() * Rs[r_i] * ric[camera_id_i] * p_i;

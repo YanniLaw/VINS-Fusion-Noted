@@ -236,7 +236,8 @@ void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Ma
         processMeasurements();
 }
 
-// 获取t0到t1的imu数据
+// 获取t0到t1的imu数据 
+// ...  t<=t0(全部丢弃)  |  (t0, t1) 这些全部输出并pop  |  第一个 >= t1 输出但不pop  |  ...
 bool Estimator::getIMUInterval(double t0, double t1, vector<pair<double, Eigen::Vector3d>> &accVector, 
                                 vector<pair<double, Eigen::Vector3d>> &gyrVector)
 {
@@ -265,7 +266,7 @@ bool Estimator::getIMUInterval(double t0, double t1, vector<pair<double, Eigen::
             gyrVector.push_back(gyrBuf.front());
             gyrBuf.pop();
         }
-        // 让输出数据序列至少包含一个跨过 t1 的样本，以便预积分实现做末端对齐(插值)
+        // note: 让输出数据序列至少包含一个跨过 t1 的样本，以便预积分实现做末端对齐(插值)
         accVector.push_back(accBuf.front());
         gyrVector.push_back(gyrBuf.front());
     }
@@ -301,8 +302,13 @@ void Estimator::processMeasurements()
         {
             feature = featureBuf.front();
             curTime = feature.first + td;
+            // 等待直到IMU数据足够
+            // VIO 的状态递推依赖IMU。要处理时刻tk的图像，必须拥有直到tk时刻为止的所有IMU数据
+            // 如果图像来了，但IMU数据还没传过来（或者IMU频率不够快、网络延迟），这里会死循环等待，直到IMU数据“追上”图像时间
+            // 确保后续的预积分（Pre-integration）能完整覆盖两帧图像之间的时间段
             while(1)
             {
+                // 如果不用IMU，或者IMU数据已经涵盖了当前图像时间戳，就可以退出等待
                 if ((!USE_IMU  || IMUAvailable(feature.first + td)))
                     break;
                 else
@@ -314,9 +320,10 @@ void Estimator::processMeasurements()
                     std::this_thread::sleep_for(dura);
                 }
             }
-            // 数据准备
+            // 数据准备: 取出IMU区间数据，消费一帧图像特征
             mBuf.lock();
             if(USE_IMU)
+                // 取出两帧图像之间的所有IMU数据, 如果是第一帧图像，则取出该图像时间戳之前的所有IMU数据
                 getIMUInterval(prevTime, curTime, accVector, gyrVector);
 
             featureBuf.pop();
@@ -326,8 +333,14 @@ void Estimator::processMeasurements()
             {
                 if(!initFirstPoseFlag) // IMU静止初始化(需要先检查是否为静止)
                     initFirstIMUPose(accVector);
+                // 预积分两帧图像之间的所有IMU数据，并推进状态到当前图像时刻curTime(而不是IMU最后一个样本时刻)
+                // 如果是第一帧图像，则从第一帧IMU时刻推进到第一帧图像时刻curTime
                 for(size_t i = 0; i < accVector.size(); i++)
                 {
+                    // 这里的积分步长 dt 的构造很关键，它把 [prevTime, curTime] 切成三类段：
+                    // 第一段：prevTime -> 第一个 IMU 样本时刻
+                    // 中间段：相邻 IMU 样本之间
+                    // 末段：最后一个 IMU 样本时刻 -> curTime
                     double dt;
                     if(i == 0)
                         dt = accVector[i].first - prevTime;
@@ -336,6 +349,10 @@ void Estimator::processMeasurements()
                     else
                         dt = accVector[i].first - accVector[i - 1].first;
                     processIMU(accVector[i].first, dt, accVector[i].second, gyrVector[i].second); // imu预积分
+                    // 这里的“最后一次processIMU”常见语义是:
+                    // 用“最后一条IMU测量值”作为区间末端附近的代表（近似零阶保持），把状态外推/积分到严格的curTime
+                    // 注意它用的是 curTime - accVector[last-1].time，而不是用 accVector[last].time，这等价于“只积分到 curTime，不积分到那条样本的真实时间（可能略晚于 curTime）”
+                    // 这也是为什么 getIMUInterval() 要确保有一个 >= curTime 的样本：没有它，末端外推会缺少测量
                 }
             }
             mProcess.lock();
@@ -382,7 +399,7 @@ void Estimator::initFirstIMUPose(vector<pair<double, Eigen::Vector3d>> &accVecto
     Matrix3d R0 = Utility::g2R(averAcc);
     double yaw = Utility::R2ypr(R0).x();
     R0 = Utility::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0; // 静止初始化的yaw设置为0
-    Rs[0] = R0;
+    Rs[0] = R0; // 只初始化旋转
     cout << "init R0 " << endl << Rs[0] << endl;
     //Vs[0] = Vector3d(5, 0, 0);
 }
@@ -396,8 +413,12 @@ void Estimator::initFirstPose(Eigen::Vector3d p, Eigen::Matrix3d r)
 }
 
 /**
- * @brief 
- * 
+ * @brief 处理每一帧原始IMU数据
+ * 1. 对IMU数据进行预积分(Pre-integration)，得到两帧图像之间IMU的增量测量，作为后续非线性优化的约束项（Factor）
+ * 2. 利用IMU数据对状态进行递推(Propagation), 利用中值积分法，实时更新当前时刻系统在世界坐标系下的位置、速度和姿态（P, V, Q），作为优化的初始猜测值（Initial Guess）
+ * 第 0 帧没有“前一帧”，所以第 0 帧不形成“帧间 IMU 因子”
+ * frame_count == 0：只更新 acc_0/gyr_0，不累计预积分、不传播 Ps/Vs/Rs
+ * frame_count != 0：开始累积从上一帧到当前帧的预积分，并传播状态
  * @param t 当前时刻
  * @param dt 与上一帧IMU数据的时间间隔
  * @param linear_acceleration 加速度数据
@@ -414,35 +435,46 @@ void Estimator::processIMU(double t, double dt, const Vector3d &linear_accelerat
 
     if (!pre_integrations[frame_count])
     {
-        // 这里的acc_0、gyr_0是在上一图像帧时间戳img_t处对应的imu观测量
+        // 每次新建预积分对象时，这里的acc_0、gyr_0就是在上一图像帧时间戳img_t处对应的imu观测量
+        // 不过，这里的acc_0、gyr_0并不是上一图像帧时刻的真实imu观测量，也不是“离散积分”过程中通过线性插值得到的近似值，而是在img_t时刻后的第一个imu观测量(>=img_t)
         // 这里构造的pre_integrations[frame_count]和构造tmp_pre_integration的是一样的参数值
+        // pre_integrations[frame_count]: 第 frame_count 帧对应的预积分器（通常表示从第 frame_count-1 帧到第 frame_count 帧的 IMU 约束在累积）
+        // 当frame_count为0时，用第一个IMU数据初始化pre_integrations[0]，但不进行预积分和状态传播
+        // 当frame_count大于0时，pre_integrations[frame_count]就用上一帧图像对应的img_t的IMU数据进行初始化
+        // tmp_pre_integration：临时预积分（常用于失败重启/重求解/非线性迭代中的快速尝试）
+        // Bas[j], Bgs[j]：第 j 帧的加速度计/陀螺偏置估计（滑窗状态的一部分）
         pre_integrations[frame_count] = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]};
     }
     // 第一帧图像数据不需要进行预积分，因为预积分是用来进行相邻两图像帧之间的约束
     if (frame_count != 0)
     {
-        pre_integrations[frame_count]->push_back(dt, linear_acceleration, angular_velocity); // 计算IMU预积分
+        // 计算IMU预积分
+        pre_integrations[frame_count]->push_back(dt, linear_acceleration, angular_velocity); // push_back是重载函数
         //if(solver_flag != NON_LINEAR)
             tmp_pre_integration->push_back(dt, linear_acceleration, angular_velocity);
-
+        // 原始 IMU 缓存（用于重传播/边缘化）
         dt_buf[frame_count].push_back(dt);
         linear_acceleration_buf[frame_count].push_back(linear_acceleration);
         angular_velocity_buf[frame_count].push_back(angular_velocity);
 
+        // 执行状态递推 (State Propagation)
         // 采用中值法离散积分更新当前图像帧对应的IMU的PVQ，并将积分出来的PVQ作为第j帧图像的状态初始值
         // 噪声是零均值的，所以这里在进行均值传递时就忽略了
         int j = frame_count;         
         Vector3d un_acc_0 = Rs[j] * (acc_0 - Bas[j]) - g;   // 上一时刻的加速度信息（减去了重力向量），基于世界坐标系
-        Vector3d un_gyr = 0.5 * (gyr_0 + angular_velocity) - Bgs[j];
+        Vector3d un_gyr = 0.5 * (gyr_0 + angular_velocity) - Bgs[j]; // 中值角速度 = (gyr_old + gyr_new) / 2 - bias 这个是基于IMU坐标系的
         Rs[j] *= Utility::deltaQ(un_gyr * dt).toRotationMatrix();
         Vector3d un_acc_1 = Rs[j] * (linear_acceleration - Bas[j]) - g; // 当前时刻的加速度信息（减去了重力向量），基于世界坐标系
-        Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1);
+        Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1);  // 中值加速度(基于世界坐标系)
         Ps[j] += dt * Vs[j] + 0.5 * dt * dt * un_acc;
         Vs[j] += dt * un_acc;
         // Rs[j]、Ps[j]、Vs[j]保存的是从IMU body系到惯性世界坐标系的PVQ，且在这里计算时，认为偏置bias是固定为初始值的
     }
     acc_0 = linear_acceleration;
     gyr_0 = angular_velocity; 
+    // 为什么既做“预积分”又做“状态传播”???
+    // 预积分（IntegrationBase）：是给滑窗优化用的 IMU 因子（约束相邻关键帧状态），优化时会根据偏置线性化点反复修正
+    // 状态传播（更新 Rs/Ps/Vs）：是在线实时给当前帧一个合理初值，否则视觉更新/非线性优化很难收敛或需要更多迭代
 }
 
 /**
@@ -452,13 +484,13 @@ void Estimator::processIMU(double t, double dt, const Vector3d &linear_accelerat
  * 1. 所有(左右双目)特征点去畸变后 在相机归一化平面的坐标(x,y,1);
  * 2. 所有(左右双目)特征点去畸变前 在图像平面的像素坐标(u,v);
  * 3. 所有(左右双目)特征点去畸变后 在相机归一化平面的速度(vx, vy).
- * @param image 图像信息
+ * @param image 提取出的图像特征数据
  * @param header 
  */
 void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const double header)
 {
     ROS_DEBUG("new image coming ------------------------------------------");
-    ROS_DEBUG("Adding feature points %lu", image.size());
+    ROS_DEBUG("Adding feature points %lu", image.size()); // image.size() 是当前帧图像中跟踪到的特征点数量
     // 为了维持滑动窗口的大小，需要去除旧的帧而添加新的帧，也就是边缘化；但是注意，边缘化一定是在滑动窗口填满之后才进行的
     // 判断次新帧是否作为关键帧，以此来确定滑窗的时候是边缘化掉滑动窗口中的最老帧还是次新帧
     if (f_manager.addFeatureCheckParallax(frame_count, image, td)) // 添加特征点到feature中，并根据路标点跟踪的次数和视差，判断次新帧是否是关键帧
@@ -475,44 +507,70 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     ROS_DEBUG("%s", marginalization_flag ? "Non-keyframe" : "Keyframe");
     ROS_DEBUG("Solving %d", frame_count);
     ROS_DEBUG("number of feature: %d", f_manager.getFeatureCount());
-    Headers[frame_count] = header;
+    Headers[frame_count] = header; // Headers数组只保存滑动窗口中的图像帧的时间，在后面会丢掉滑动窗口之外的数据
 
     ImageFrame imageframe(image, header);
-    imageframe.pre_integration = tmp_pre_integration;
-    all_image_frame.insert(make_pair(header, imageframe));
+    imageframe.pre_integration = tmp_pre_integration; // 第一帧图像的tmp_pre_integration为NULL
+    all_image_frame.insert(make_pair(header, imageframe)); // all_image_frame 中元素的删除在 SlideWindow()
+    // 这里的acc_0、gyr_0是在当前图像帧时间戳img_t处对应的imu观测量
+    // 其实并不是严格对应，因为IMU数据是离散的，而图像时间戳通常落在两个IMU样本之间 参考取imu区间的函数 getIMUInterval() 会大于时间戳
+    // 是否考虑进行插值???
     tmp_pre_integration = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]};
 
-    if(ESTIMATE_EXTRINSIC == 2)
+    if(ESTIMATE_EXTRINSIC == 2) // 没有提供外参， 进行外参在线标定
     {
         ROS_INFO("calibrating extrinsic param, rotation movement is needed");
-        if (frame_count != 0)
+        if (frame_count != 0) // 外参在线标定要从第二帧才会开始，因为从第二帧开始才会有预积分数据
         {
+            // 获取前一帧与当前帧对应匹配的所有路标点，分别在这两帧下的相机归一化平面坐标
             vector<pair<Vector3d, Vector3d>> corres = f_manager.getCorresponding(frame_count - 1, frame_count);
             Matrix3d calib_ric;
+            // 这里只估计从camera坐标系到IMU坐标系的旋转外参calib_ric，这里没有估计平移外参
+            // 相机与IMU之间的旋转外参标定非常重要，偏差1-2°系统的精度就会变的极低
             if (initial_ex_rotation.CalibrationExRotation(corres, pre_integrations[frame_count]->delta_q, calib_ric))
             {
+                // 一般是刚好在进行初始化开始之前，会完成旋转外参的标定
                 ROS_WARN("initial extrinsic rotation calib success");
                 ROS_WARN_STREAM("initial extrinsic rotation: " << endl << calib_ric);
                 ric[0] = calib_ric;
                 RIC[0] = calib_ric;
-                ESTIMATE_EXTRINSIC = 1;
+                ESTIMATE_EXTRINSIC = 1; // 先估计出旋转外参后，以这个旋转外参为初始参考值，后续再继续估计
             }
         }
     }
-
-    if (solver_flag == INITIAL)
+// 简单介绍下滑窗:
+// 滑动窗口内的帧索引都是 0 ~ WINDOW_SIZE
+// 初始化阶段：系统刚启动，窗口是空的。每来一帧，frame_count 加 1。Ps[], Rs[] 数组慢慢被填满，直到 frame_count == WINDOW_SIZE 时，窗口填满，开始初始化
+// 稳定运行阶段：初始化完成后，frame_count 固定为 WINDOW_SIZE，窗口满了。每来一帧，滑动窗口就前进一格，frame_count 仍然是 WINDOW_SIZE
+//    - 新的一帧进来: 此时实际上有 WINDOW_SIZE + 1 帧数据了
+//    - 优化: 进行非线性优化
+//    - 滑动窗口: 为了保持计算量恒定，系统必须踢出一帧（要么是最老的一帧，要么是次新帧）
+//    - 结果：踢出一帧后，剩下的帧数依然是 WINDOW_SIZE   
+    if (solver_flag == INITIAL) // 系统最开始需要进行视觉-惯性联合初始化
     {
-        // monocular + IMU initilization
+        // monocular + IMU initilization 单目+IMU初始化
+        // 单目没有尺度信息，必须靠IMU恢复尺度
         if (!STEREO && USE_IMU)
         {
+            // 单目初始化需要等滑动窗口填满后才进行，确保有足够多的图像帧参与初始化
             if (frame_count == WINDOW_SIZE)
             {
                 bool result = false;
+                // 要保证已经成功完成了外参标定；且当前帧距上一次初始化帧的时间间隔要大于0.1秒，限制初始化尝试频率（避免每帧都跑一次初始化，节省算力并减少抖动）
+                // 因为初始化过程不是每次都能成功的，所以这里用initial_timestamp记录上一次尝试初始化的时间戳
                 if(ESTIMATE_EXTRINSIC != 2 && (header - initial_timestamp) > 0.1)
                 {
+                    // 进行初始化的目的主要有两个：
+                    // 1. 如果没有恢复出一个良好的尺度，就无法对单目相机、IMU这两个传感器做进一步的融合；这主要体现在平移以及三角化得到的路标点的深度；
+                    // 因为之后在非线性优化阶段的量都是以IMU积分出来的值作为初值，它天然的带有尺度。
+                    // 2. IMU会受到bias的影响，所以要得到IMU的初始bias。
+                    // 初始化只进行一次就够了，因为初始化的时候，就能确定尺度scale和bias的初始值，
+                    // 尺度scale确定后，在初始化时获得的这些路标点都是准的了，后续通过PnP或者BA得到的特征点都是真实尺度的了。
+                    // 而bias初始值确定之后，在后续的非线性优化过程中，会实时更新。
                     result = initialStructure();
-                    initial_timestamp = header;   
+                    initial_timestamp = header; // 记录本次初始化尝试的时间戳  
                 }
+                // 初始化成功
                 if(result)
                 {
                     optimization();
@@ -521,12 +579,12 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
                     slideWindow();
                     ROS_INFO("Initialization finish!");
                 }
-                else
+                else // 如果此次初始化失败，则要直接滑动窗口丢掉一帧，然后再进行初始化，直到初始化完成
                     slideWindow();
             }
         }
 
-        // stereo + IMU initilization
+        // stereo + IMU initilization 双目+IMU初始化
         if(STEREO && USE_IMU)
         {
             f_manager.initFramePoseByPnP(frame_count, Ps, Rs, tic, ric);
@@ -554,7 +612,7 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
             }
         }
 
-        // stereo only initilization
+        // stereo only initilization 双目初始化
         if(STEREO && !USE_IMU)
         {
             f_manager.initFramePoseByPnP(frame_count, Ps, Rs, tic, ric);
@@ -570,7 +628,8 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
                 ROS_INFO("Initialization finish!");
             }
         }
-
+        // 在初始化完成前，如果窗口没满，系统只是简单地把数据塞进数组，并把上一帧的位姿复制过来占位，等待下一帧数据
+        // 从第二帧开始，这里的数据就不是零了，因为在processIMU()中已经对Ps/Vs/Rs做了状态传播
         if(frame_count < WINDOW_SIZE)
         {
             frame_count++;

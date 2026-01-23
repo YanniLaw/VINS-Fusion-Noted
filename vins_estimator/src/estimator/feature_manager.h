@@ -25,7 +25,7 @@ using namespace Eigen;
 #include "parameters.h"
 #include "../utility/tic_toc.h"
 
-// 每个路标点在一个图像帧中的观测信息
+// 每个路标点在一个图像帧中的观测信息(包含左右目观测)
 class FeaturePerFrame
 {
   public:

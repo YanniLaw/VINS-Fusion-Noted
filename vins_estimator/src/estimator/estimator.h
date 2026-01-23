@@ -125,13 +125,13 @@ class Estimator
     double Headers[(WINDOW_SIZE + 1)];
 
     IntegrationBase *pre_integrations[(WINDOW_SIZE + 1)];
-    Vector3d acc_0, gyr_0;
+    Vector3d acc_0, gyr_0; // 上一时刻的IMU测量值,基于IMU坐标系(用于中值法/预积分的左端点)
 
     vector<double> dt_buf[(WINDOW_SIZE + 1)];
     vector<Vector3d> linear_acceleration_buf[(WINDOW_SIZE + 1)];
     vector<Vector3d> angular_velocity_buf[(WINDOW_SIZE + 1)];
 
-    int frame_count; // 帧数目
+    int frame_count; // 帧数目，从0开始计数,最大是 WINDOW_SIZE
     int sum_of_outlier, sum_of_back, sum_of_front, sum_of_invalid;
     int inputImageCnt;
 
@@ -162,8 +162,8 @@ class Estimator
     MarginalizationInfo *last_marginalization_info;
     vector<double *> last_marginalization_parameter_blocks;
 
-    map<double, ImageFrame> all_image_frame;
-    IntegrationBase *tmp_pre_integration;
+    map<double, ImageFrame> all_image_frame; // 存储所有图像帧数据ImageFrame的关联容器，key为时间戳
+    IntegrationBase *tmp_pre_integration; // 一个临时的积分器，用于前端快速发布 odometry，不参与后端优化
 
     Eigen::Vector3d initP;
     Eigen::Matrix3d initR;
