@@ -26,11 +26,11 @@ using namespace std;
 
 struct SFMFeature
 {
-    bool state;
-    int id;
-    vector<pair<int,Vector2d>> observation;
-    double position[3];
-    double depth;
+    bool state; // 路标点的状态（是否被成功三角化了）
+    int id;			// 路标点的id(唯一)
+    vector<pair<int,Vector2d>> observation; // 观测到该路标点的所有图像帧在滑动窗口中的id以及该路标点在该帧相机坐标系下的去畸变后的相机归一化平面坐标
+    double position[3];	// 成功三角化之后的3d坐标。注意，这个3d坐标的参考坐标系是l帧相机坐标系
+    double depth;				// 深度
 };
 
 struct ReprojectionError3D

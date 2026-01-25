@@ -541,6 +541,7 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
 // 简单介绍下滑窗:
 // 滑动窗口内的帧索引都是 0 ~ WINDOW_SIZE
 // 初始化阶段：系统刚启动，窗口是空的。每来一帧，frame_count 加 1。Ps[], Rs[] 数组慢慢被填满，直到 frame_count == WINDOW_SIZE 时，窗口填满，开始初始化
+//           我们在填满窗口的过程中不关心每一帧是否为关键帧，只会在窗口满了再用次新帧是否为关键帧进行滑窗操作
 // 稳定运行阶段：初始化完成后，frame_count 固定为 WINDOW_SIZE，窗口满了。每来一帧，滑动窗口就前进一格，frame_count 仍然是 WINDOW_SIZE
 //    - 新的一帧进来: 此时实际上有 WINDOW_SIZE + 1 帧数据了
 //    - 优化: 进行非线性优化
@@ -553,10 +554,12 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
         if (!STEREO && USE_IMU)
         {
             // 单目初始化需要等滑动窗口填满后才进行，确保有足够多的图像帧参与初始化
+            // 窗口满了就开始进行初始化，此时对里面的每一帧是不是关键帧没有要求
             if (frame_count == WINDOW_SIZE)
             {
                 bool result = false;
-                // 要保证已经成功完成了外参标定；且当前帧距上一次初始化帧的时间间隔要大于0.1秒，限制初始化尝试频率（避免每帧都跑一次初始化，节省算力并减少抖动）
+                // 1. 要保证已经成功完成了外参标定，如果是在线估计外参则要先成功估计好外参之后才会进入到初始化中
+                // 2. 且当前帧距上一次初始化帧的时间间隔要大于0.1秒，限制初始化尝试频率（避免每帧都跑一次初始化，节省算力并减少抖动）
                 // 因为初始化过程不是每次都能成功的，所以这里用initial_timestamp记录上一次尝试初始化的时间戳
                 if(ESTIMATE_EXTRINSIC != 2 && (header - initial_timestamp) > 0.1)
                 {
@@ -685,9 +688,22 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     }  
 }
 
+/**
+ * @brief  VINS初始化采用视觉和IMU的松耦合初始化方案，主要分两步：
+ * 1. 首先通过视觉SFM求解滑窗内所有帧的位姿，以及所有路标点的3D位置。
+ * 2. 和IMU预积分进行对齐，求解重力、尺度、陀螺仪bias、以及每一帧的速度。
+ * 在不知道尺度的情况下，先建立一个纯视觉的 3D 结构（SfM），然后将这个视觉结构与 IMU 的预积分结果进行“对齐”，
+ * 从而恢复出物理尺度、重力方向、速度以及陀螺仪偏置。
+ * @return true 
+ * @return false 
+ */
 bool Estimator::initialStructure()
 {
     TicToc t_sfm;
+    // 通过线加速度的标准差来判断IMU是否有充分的运动激励。
+    // 对于单目系统而言，视觉信息只能获得二维信息，损失了深度信息，所以需要相机动一下，通过三角化才能获得损失的深度信息，
+    // 但是三角化恢复的这个深度信息，它的尺度是随机的，不是真实物理的，所以还需要IMU来标定这个尺度，
+    // 而要想让IMU标定这个尺度，IMU也需要平移运动一下，得到PVQ中的P。
     //check imu observibility
     {
         map<double, ImageFrame>::iterator frame_it;
@@ -699,7 +715,8 @@ bool Estimator::initialStructure()
             sum_g += tmp_g;
         }
         Vector3d aver_g;
-        aver_g = sum_g * 1.0 / ((int)all_image_frame.size() - 1);
+        aver_g = sum_g * 1.0 / ((int)all_image_frame.size() - 1); // 计算所有帧的平均加速度
+        // 计算加速度的方差
         double var = 0;
         for (frame_it = all_image_frame.begin(), frame_it++; frame_it != all_image_frame.end(); frame_it++)
         {
@@ -708,8 +725,10 @@ bool Estimator::initialStructure()
             var += (tmp_g - aver_g).transpose() * (tmp_g - aver_g);
             //cout << "frame g " << tmp_g.transpose() << endl;
         }
-        var = sqrt(var / ((int)all_image_frame.size() - 1));
+        var = sqrt(var / ((int)all_image_frame.size() - 1)); // 标准差
         //ROS_WARN("IMU variation %f!", var);
+        // 如果设备静止，加速度计测量的主要是重力，方差应该非常小（只有噪声）。
+        // 如果设备有运动（旋转或平移），加速度会有剧烈波动，方差变大
         if(var < 0.25)
         {
             ROS_INFO("IMU excitation not enouth!");
@@ -721,6 +740,7 @@ bool Estimator::initialStructure()
     Vector3d T[frame_count + 1];
     map<int, Vector3d> sfm_tracked_points;
     vector<SFMFeature> sfm_f;
+    // 遍历滑窗中的所有特征点，将特征管理器(f_manager)中的数据转换为SfM需要的格式
     for (auto &it_per_id : f_manager.feature)
     {
         int imu_j = it_per_id.start_frame - 1;
@@ -892,26 +912,44 @@ bool Estimator::visualInitialAlign()
     return true;
 }
 
+/**
+ * @brief 在滑动窗口中寻找一个“最合适”的参考帧，与当前最新的帧进行对极几何求解，从而算出它们之间的相对旋转（R）和平移（T）
+ * 这个相对位姿将作为后续 SfM（Structure from Motion）构建局部地图的**“种子”或“基准尺”**
+ * 在初始化时，我们需要建立一个局部地图。但是，并不是随便找两帧就能算出可靠的位姿。
+ *   - 如果两帧间隔太近（视差太小），三角化出来的深度误差极大，甚至会有负深度。
+ *   - 如果共视点太少，解算本质矩阵（Essential Matrix）会很不稳定。
+ * 因此，这个函数采用了一个“从远到近”的策略来筛选帧。
+ * @param relative_R 当前最新帧到l帧之间的旋转矩阵R
+ * @param relative_T 当前最新帧到l帧之间的平移矩阵
+ * @param l 滑窗中最满足跟当前最新帧进行初始化的那一帧(l为在滑窗中的索引)
+ * @return true 
+ * @return false 
+ */
 bool Estimator::relativePose(Matrix3d &relative_R, Vector3d &relative_T, int &l)
 {
     // find previous frame which contians enough correspondance and parallex with newest frame
-    for (int i = 0; i < WINDOW_SIZE; i++)
+    for (int i = 0; i < WINDOW_SIZE; i++) // 从最老的一帧往新帧遍历
     {
-        vector<pair<Vector3d, Vector3d>> corres;
-        corres = f_manager.getCorresponding(i, WINDOW_SIZE);
+        vector<pair<Vector3d, Vector3d>> corres; // (i, WINDOW_SIZE) 去畸变归一化平面坐标
+        corres = f_manager.getCorresponding(i, WINDOW_SIZE); // 获取第 i 帧和最新帧（WINDOW_SIZE）之间的所有共视特征点
+        // 共视特征点数量要大于一定的阈值， 20 是经验阈值，保证一定的鲁棒性余量
+        // 求解对极几何（五点法或八点法）理论上只需要 5 或 8 个点，但在工程中，RANSAC 剔除外点后剩下的点往往不多，且存在噪声。
         if (corres.size() > 20)
         {
+            // 计算视差
             double sum_parallax = 0;
             double average_parallax;
             for (int j = 0; j < int(corres.size()); j++)
             {
                 Vector2d pts_0(corres[j].first(0), corres[j].first(1));
                 Vector2d pts_1(corres[j].second(0), corres[j].second(1));
-                double parallax = (pts_0 - pts_1).norm();
+                double parallax = (pts_0 - pts_1).norm(); // 计算该特征点在两帧之间的移动距离（欧氏距离）
                 sum_parallax = sum_parallax + parallax;
 
             }
-            average_parallax = 1.0 * sum_parallax / int(corres.size());
+            average_parallax = 1.0 * sum_parallax / int(corres.size()); // 这里是归一化视差，没有单位，下面转换成像素级单位
+            // 平均像素视差大于一定的值，这里460是焦距f的一个经验值
+            // 利用共视特征点能够求解对极约束，解算出本质矩阵，并恢复R/T
             if(average_parallax * 460 > 30 && m_estimator.solveRelativeRT(corres, relative_R, relative_T))
             {
                 l = i;
