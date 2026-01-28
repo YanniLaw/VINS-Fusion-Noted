@@ -690,7 +690,7 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
 
 /**
  * @brief  VINS初始化采用视觉和IMU的松耦合初始化方案，主要分两步：
- * 1. 首先通过视觉SFM求解滑窗内所有帧的位姿，以及所有路标点的3D位置。
+ * 1. 在未知尺度的情况下，首先通过纯视觉SFM求解滑窗内所有帧的位姿，以及所有路标点的3D位置。
  * 2. 和IMU预积分进行对齐，求解重力、尺度、陀螺仪bias、以及每一帧的速度。
  * 在不知道尺度的情况下，先建立一个纯视觉的 3D 结构（SfM），然后将这个视觉结构与 IMU 的预积分结果进行“对齐”，
  * 从而恢复出物理尺度、重力方向、速度以及陀螺仪偏置。
@@ -736,10 +736,10 @@ bool Estimator::initialStructure()
         }
     }
     // global sfm
-    Quaterniond Q[frame_count + 1];
-    Vector3d T[frame_count + 1];
-    map<int, Vector3d> sfm_tracked_points;
-    vector<SFMFeature> sfm_f;
+    Quaterniond Q[frame_count + 1]; // 记录初始化时滑窗中每一帧的姿态(相对于起始帧)
+    Vector3d T[frame_count + 1];    // 记录初始化时滑窗中每一帧的位置(相对于起始帧)
+    map<int, Vector3d> sfm_tracked_points; // 记录初始化时所有成功三角化的路标点(相对于起始帧), key: feature_id, value: 3d point
+    vector<SFMFeature> sfm_f; // 存储滑窗中所有特征点观测信息的容器
     // 遍历滑窗中的所有特征点，将特征管理器(f_manager)中的数据转换为SfM需要的格式
     for (auto &it_per_id : f_manager.feature)
     {
@@ -758,18 +758,22 @@ bool Estimator::initialStructure()
     Matrix3d relative_R;
     Vector3d relative_T;
     int l;
+    // 从滑窗中找到距离当前帧具有足够视差的参考帧l，并由本质矩阵恢复出R、t作为初始值
+    // l帧指的是，在滑动窗口中，从第一帧开始，首个满足与当前帧的平均视差足够大的帧，并且它还会做为参考帧在下面的全局sfm中使用。（找出的这个l一般都等于0）
+    // 此处的relative_R，relative_T是当前帧到参考帧cl（l帧）的坐标变换R、t
     if (!relativePose(relative_R, relative_T, l))
     {
         ROS_INFO("Not enough features or parallax; Move device around");
         return false;
     }
+    // 求解纯视觉SFM问题，这里将l帧作为参考帧，得到滑动窗口中的每一图像帧到l帧（参考帧）的姿态四元数Q、平移向量T和成功三角化的3d路标点坐标sfm_tracked_points
     GlobalSFM sfm;
-    if(!sfm.construct(frame_count + 1, Q, T, l,
+    if(!sfm.construct(frame_count + 1, Q, T, l, // 这里为什么是frame_count + 1? 因为这里传入的是当前滑窗中的图片总帧数
               relative_R, relative_T,
               sfm_f, sfm_tracked_points))
     {
         ROS_DEBUG("global SFM failed!");
-        marginalization_flag = MARGIN_OLD;
+        marginalization_flag = MARGIN_OLD; // 若求解SFM问题失败，则边缘化最老帧并滑动窗口
         return false;
     }
 
