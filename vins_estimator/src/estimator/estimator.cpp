@@ -777,59 +777,86 @@ bool Estimator::initialStructure()
         return false;
     }
 
+    // 注意在前面针对的都是在当前滑动窗口中的帧
+    // 在之前的步骤中，GlobalSFM 仅解算了滑动窗口中关键帧(或被当作关键帧的帧)的位姿（即 Headers 数组里记录的那几帧）
+    // 但是，VINS 的缓存队列 all_image_frame 中保存了过去几秒内的所有图像帧（可能包含很多非关键帧/中间帧）。
+    // 为了后续能精确地跟 IMU 积分（它是连续的）进行对比，我们需要知道每一帧的位姿，而不仅仅是关键帧的位姿。
+    // 因此，这段代码的任务是：利用 SfM 已经建立好的 3D 地图点，通过 PnP 算法，把那些没参与 SfM 的“中间帧”的位姿也都算出来
     //solve pnp for all frame
     map<double, ImageFrame>::iterator frame_it;
     map<int, Vector3d>::iterator it;
     frame_it = all_image_frame.begin( );
-    for (int i = 0; frame_it != all_image_frame.end( ); frame_it++)
+    for (int i = 0; frame_it != all_image_frame.end( ); frame_it++) // 遍历所有的图像帧
     {
         // provide initial guess
         cv::Mat r, rvec, t, D, tmp_r;
-        if((frame_it->first) == Headers[i])
+        // 情况 A：当前帧是 SfM 算过的“关键帧”
+        if((frame_it->first) == Headers[i]) // 该帧在滑动窗口中，直接使用前面SFM结果
         {
-            frame_it->second.is_key_frame = true;
-            frame_it->second.R = Q[i].toRotationMatrix() * RIC[0].transpose();
-            frame_it->second.T = T[i];
+            // SfM 算的是相机在世界下的位姿，而VINS需要的是 IMU 在世界下的位姿
+            frame_it->second.is_key_frame = true; // RIC[0] 左目 R_imu_cam
+            frame_it->second.R = Q[i].toRotationMatrix() * RIC[0].transpose(); // R^cl_ci * (R_imu_cam)^T 在前面的sfm中求解的是相对于参考帧cl的旋转，这里要转换到IMU body系下
+            frame_it->second.T = T[i]; // 此时尺度s还未估计出来，因此还不能对平移做变换
             i++;
             continue;
         }
+        // 对于不在当前滑动窗口中的帧，根据上一步SFM得到的3d路标点，通过PNP求解出该图像帧的位姿
+        // 因为在之前的初始化流程中有可能出现失败了，并且当之前的窗口数据满了时，还会进行滑窗丢弃，
+        // 丢弃最老帧也可能丢弃次新帧，这就造成了在当前滑动窗口中的帧可能不是全局连续的
+
+        // 情况 B：当前帧是没算过的“中间帧”    如果时间戳不匹配，说明这是一帧中间帧，需要我们自己算
+        // 假设 all_image_frame 的时间戳递增，Headers[] 也递增。遇到非关键帧时，i 指向“它附近”的关键帧索引，用作 PnP 初值
         if((frame_it->first) > Headers[i])
         {
             i++;
         }
-        Matrix3d R_inital = (Q[i].inverse()).toRotationMatrix();
-        Vector3d P_inital = - R_inital * T[i];
+        Matrix3d R_inital = (Q[i].inverse()).toRotationMatrix(); // 这里的R_inital是到世界系(滑窗中第l帧坐标系)到滑窗中第i帧图像系的变换 R_C_W
+        Vector3d P_inital = - R_inital * T[i]; // t_cw = -R_cw * t_wc
         cv::eigen2cv(R_inital, tmp_r);
-        cv::Rodrigues(tmp_r, rvec);
+        cv::Rodrigues(tmp_r, rvec); //罗德里格斯公式将旋转矩阵转换成旋转向量
         cv::eigen2cv(P_inital, t);
 
         frame_it->second.is_key_frame = false;
-        vector<cv::Point3f> pts_3_vector;
-        vector<cv::Point2f> pts_2_vector;
-        for (auto &id_pts : frame_it->second.points)
+        vector<cv::Point3f> pts_3_vector;   // 存储3d路标点
+        vector<cv::Point2f> pts_2_vector;   // 存储2d对应像素点，大小与pts_3_vector一样，且一一对应
+        // map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>> > > points; 是特征提取的一个数据结构
+        // 是当前帧(包括左右双目)所有图像特征点id与左右双目特征点对应信息的键值对，(feature_id, [camera_id, [x,y,z,u,v,vx,vy]])
+        for (auto &id_pts : frame_it->second.points) // 遍历该图像帧的所有特征点，并构造3d-2d点的匹配对
         {
-            int feature_id = id_pts.first;
-            for (auto &i_p : id_pts.second)
+            int feature_id = id_pts.first; // 特征点id(唯一)
+            for (auto &i_p : id_pts.second) // 遍历该特征点在各个相机下的观测(左右双目)
             {
                 it = sfm_tracked_points.find(feature_id);
-                if(it != sfm_tracked_points.end())
+                if(it != sfm_tracked_points.end()) // 如果该特征点在前面的初始化sfm过程中被成功三角化
                 {
-                    Vector3d world_pts = it->second;
+                    Vector3d world_pts = it->second; // 获取该特征点的3d路标点坐标(相对于参考帧l)
                     cv::Point3f pts_3(world_pts(0), world_pts(1), world_pts(2));
                     pts_3_vector.push_back(pts_3);
-                    Vector2d img_pts = i_p.second.head<2>();
+                    Vector2d img_pts = i_p.second.head<2>(); // 该特征点在当前帧下的相机归一化平面坐标
                     cv::Point2f pts_2(img_pts(0), img_pts(1));
                     pts_2_vector.push_back(pts_2);
                 }
             }
         }
-        cv::Mat K = (cv::Mat_<double>(3, 3) << 1, 0, 0, 0, 1, 0, 0, 0, 1);     
+        cv::Mat K = (cv::Mat_<double>(3, 3) << 1, 0, 0, 0, 1, 0, 0, 0, 1);  // 因为是相机归一化平面坐标，所以这里的K是单位阵   
         if(pts_3_vector.size() < 6)
         {
             cout << "pts_3_vector size " << pts_3_vector.size() << endl;
             ROS_DEBUG("Not enough points for solve pnp !");
             return false;
         }
+        /*
+        bool cv::solvePnP(
+            InputArray objectPoints,   // 输入：世界坐标系下的 3D 点 (vector<Point3f>)
+            InputArray imagePoints,    // 输入：图像平面上的 2D 点 (vector<Point2f>)
+            InputArray cameraMatrix,   // 输入：相机内参矩阵 K (3x3)
+            InputArray distCoeffs,     // 输入：畸变系数 (如果点已经去畸变，这里传空)
+            OutputArray rvec,          // 输出：旋转向量 (Rodrigues 向量, 3x1)
+            OutputArray tvec,          // 输出：平移向量 (3x1)
+            bool useExtrinsicGuess = false, // 是否使用 rvec/tvec 的初始值进行优化
+            int flags = SOLVEPNP_ITERATIVE  // 求解方法
+        );
+        */
         if (! cv::solvePnP(pts_3_vector, pts_2_vector, K, D, rvec, t, 1))
         {
             ROS_DEBUG("solve pnp fail!");
