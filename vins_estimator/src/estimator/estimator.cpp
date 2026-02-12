@@ -846,16 +846,27 @@ bool Estimator::initialStructure()
             return false;
         }
         /*
-        bool cv::solvePnP(
+        bool cv::solvePnP( 已知 3D 点的世界坐标和它们在图像上的 2D 像素坐标，求解相机的位姿（旋转和平移）
             InputArray objectPoints,   // 输入：世界坐标系下的 3D 点 (vector<Point3f>)
-            InputArray imagePoints,    // 输入：图像平面上的 2D 点 (vector<Point2f>)
-            InputArray cameraMatrix,   // 输入：相机内参矩阵 K (3x3)
+            InputArray imagePoints,    // 输入：图像平面上的 2D 点 (vector<Point2f>)，可以是像素坐标也可以是归一化平面坐标
+            InputArray cameraMatrix,   // 输入：相机内参矩阵 K (3x3)，像素坐标系下需要传入真实内参，归一化平面坐标系下传单位阵
             InputArray distCoeffs,     // 输入：畸变系数 (如果点已经去畸变，这里传空)
-            OutputArray rvec,          // 输出：旋转向量 (Rodrigues 向量, 3x1)
-            OutputArray tvec,          // 输出：平移向量 (3x1)
+            OutputArray rvec,          // 输出：旋转向量 (Rodrigues 向量, 描述世界坐标系如何转到相机坐标系，即 R_c_w)
+            OutputArray tvec,          // 输出：平移向量 (描述世界原点在相机坐标系下的位置，即 t_c_w)
             bool useExtrinsicGuess = false, // 是否使用 rvec/tvec 的初始值进行优化
             int flags = SOLVEPNP_ITERATIVE  // 求解方法
-        );
+        ); // objectPoints / imagePoints 必须一一对应，即objectPoints[i] 与 imagePoints[i] 是同一个特征点的 3D/2D
+        点数下限  一般最少 4 个点（P3P 类方法）或 6 个点（DLT/迭代更稳），工程上建议 >20 且有足够视差/分布
+        常用 flags:
+            SOLVEPNP_ITERATIVE：迭代法（Levenberg-Marquardt 非线性优化）精度最高，速度慢，依赖初值          工程最佳场景：连续跟踪 (Tracking)
+            SOLVEPNP_P3P：P3P 算法，需要且仅需要 4 个点，速度快，但对噪声敏感，且有多解，需要额外点来消除歧义    工程最佳场景：solvePnPRansac 的内核
+            SOLVEPNP_EPNP：EPnP 算法，非迭代算法，速度快，精度一般,点多时常用作初值              工程最佳场景：全局重定位 / 掉线找回 / 初始化
+            SOLVEPNP_IPPE / SOLVEPNP_IPPE_SQUARE: 这是二维码/Tag 识别专用的                工程最佳场景：AprilTag, Aruco, 二维码识别
+        典型失败/误解来源:
+            1. 3D 点尺度错/坐标系错（例如 SfM 点尺度不定但你当成米）;
+            2. 2D 点未去畸变但你当成去畸变点了（或反之）;
+            3. 点集中在小区域 / 近共面 → 退化;
+            4. 外点没剔除（应考虑 solvePnPRansac）
         */
         if (! cv::solvePnP(pts_3_vector, pts_2_vector, K, D, rvec, t, 1))
         {
@@ -865,13 +876,15 @@ bool Estimator::initialStructure()
         cv::Rodrigues(rvec, r);
         MatrixXd R_pnp,tmp_R_pnp;
         cv::cv2eigen(r, tmp_R_pnp);
-        R_pnp = tmp_R_pnp.transpose();
+        R_pnp = tmp_R_pnp.transpose(); // R_w_c
         MatrixXd T_pnp;
         cv::cv2eigen(t, T_pnp);
-        T_pnp = R_pnp * (-T_pnp);
-        frame_it->second.R = R_pnp * RIC[0].transpose();
+        T_pnp = R_pnp * (-T_pnp);   // t_w_c = -R_w_c * t_c_w
+        frame_it->second.R = R_pnp * RIC[0].transpose(); // 转换到IMU body系下 R_w_i = R_w_c * R_c_i
         frame_it->second.T = T_pnp;
     }
+    // 进行视觉-惯性联合初始化
+    // 因为视觉SFM在初始化的过程中有着较好的表现，所以在初始化的过程中主要以SFM为主，然后将IMU的预积分结果与其对齐，即可得到较好的初始化结果
     if (visualInitialAlign())
         return true;
     else
@@ -882,11 +895,19 @@ bool Estimator::initialStructure()
 
 }
 
+// 将之前建立的“纯视觉 SfM 地图”（任意尺度、任意方向）与 IMU 预积分进行融合，
+// 解算出真实的物理尺度（Scale）、重力方向（Gravity）、初始速度（Velocity）和陀螺仪偏置（Gyro Bias），
+// 并将整个系统转换到重力对齐的世界坐标系（Z轴垂直向上）
 bool Estimator::visualInitialAlign()
 {
     TicToc t_g;
     VectorXd x;
     //solve scale
+    // 将视觉SFM结果与IMU预积分结果进行对齐，
+    // 得到陀螺仪偏置Bgs、在body坐标系下表示的每一IMU速度V^bn_bn、在cl帧坐标系下表示的重力向量g^cl、尺度因子s
+    // 这里没有处理线加速度偏置，因为重力是初始化过程中的待求量，而线加速度计偏置与重力耦合；
+    // 而且系统的线加速度相对于重力加速度很小，所以线加速度计偏置在初始化过程中很难观测，
+    // 因此初始化过程中不考虑线加速度计偏置的估计
     bool result = VisualIMUAlignment(all_image_frame, Bgs, g, x);
     if(!result)
     {
@@ -895,17 +916,17 @@ bool Estimator::visualInitialAlign()
     }
 
     // change state
-    for (int i = 0; i <= frame_count; i++)
+    for (int i = 0; i <= frame_count; i++) // 遍历当前滑动窗口中的所有图像帧
     {
-        Matrix3d Ri = all_image_frame[Headers[i]].R;
-        Vector3d Pi = all_image_frame[Headers[i]].T;
+        Matrix3d Ri = all_image_frame[Headers[i]].R; // 该图像帧时对应的IMU坐标系到相机帧l坐标系的旋转变换
+        Vector3d Pi = all_image_frame[Headers[i]].T; // 该图像帧到相机帧l坐标系的平移变换，即第l帧相机坐标系原点->i帧相机坐标系原点的平移向量，以第l帧坐标系为参考坐标系
         Ps[i] = Pi;
         Rs[i] = Ri;
         all_image_frame[Headers[i]].is_key_frame = true;
     }
 
     double s = (x.tail<1>())(0);
-    for (int i = 0; i <= WINDOW_SIZE; i++)
+    for (int i = 0; i <= WINDOW_SIZE; i++) // 更新了陀螺仪的偏置Bgs之后，需要重新计算IMU预积分
     {
         pre_integrations[i]->repropagate(Vector3d::Zero(), Bgs[i]);
     }
