@@ -324,6 +324,7 @@ void Estimator::processMeasurements()
             mBuf.lock();
             if(USE_IMU)
                 // 取出两帧图像之间的所有IMU数据, 如果是第一帧图像，则取出该图像时间戳之前的所有IMU数据
+                // 每次调用该函数的时候，当前帧取的accVector第一个数据都是上一帧取的accVector最后一个数据
                 getIMUInterval(prevTime, curTime, accVector, gyrVector);
 
             featureBuf.pop();
@@ -331,7 +332,7 @@ void Estimator::processMeasurements()
 
             if(USE_IMU)
             {
-                if(!initFirstPoseFlag) // IMU静止初始化(需要先检查是否为静止)
+                if(!initFirstPoseFlag) // IMU姿态初始化(需要先检查是否为静止)
                     initFirstIMUPose(accVector);
                 // 预积分两帧图像之间的所有IMU数据，并推进状态到当前图像时刻curTime(而不是IMU最后一个样本时刻)
                 // 如果是第一帧图像，则从第一帧IMU时刻推进到第一帧图像时刻curTime
@@ -352,7 +353,7 @@ void Estimator::processMeasurements()
                     // 这里的“最后一次processIMU”常见语义是:
                     // 用“最后一条IMU测量值”作为区间末端附近的代表（近似零阶保持），把状态外推/积分到严格的curTime
                     // 注意它用的是 curTime - accVector[last-1].time，而不是用 accVector[last].time，这等价于“只积分到 curTime，不积分到那条样本的真实时间（可能略晚于 curTime）”
-                    // 这也是为什么 getIMUInterval() 要确保有一个 >= curTime 的样本：没有它，末端外推会缺少测量
+                    // 这是因为getIMUInterval得到的Imu最后一个样本的时间戳是>=curTime的，所以用的是last-1
                 }
             }
             mProcess.lock();
@@ -420,7 +421,7 @@ void Estimator::initFirstPose(Eigen::Vector3d p, Eigen::Matrix3d r)
  * frame_count == 0：只更新 acc_0/gyr_0，不累计预积分、不传播 Ps/Vs/Rs
  * frame_count != 0：开始累积从上一帧到当前帧的预积分，并传播状态
  * @param t 当前时刻
- * @param dt 与上一帧IMU数据的时间间隔
+ * @param dt 与上一帧IMU数据的时间间隔 这里的dt 有三种来源，具体见前面dt的计算
  * @param linear_acceleration 加速度数据
  * @param angular_velocity 角速度数据
  */
@@ -432,7 +433,8 @@ void Estimator::processIMU(double t, double dt, const Vector3d &linear_accelerat
         acc_0 = linear_acceleration;
         gyr_0 = angular_velocity;
     }
-
+    // 这里的frame_count是滑窗中的图像帧数目，从0开始计数,最大是 WINDOW_SIZE
+    // 只在初始化的过程中进行自增操作，初始化完成后，frame_count就固定为WINDOW_SIZE
     if (!pre_integrations[frame_count])
     {
         // 每次新建预积分对象时，这里的acc_0、gyr_0就是在上一图像帧时间戳img_t处对应的imu观测量
@@ -440,9 +442,9 @@ void Estimator::processIMU(double t, double dt, const Vector3d &linear_accelerat
         // 这里构造的pre_integrations[frame_count]和构造tmp_pre_integration的是一样的参数值
         // pre_integrations[frame_count]: 第 frame_count 帧对应的预积分器（通常表示从第 frame_count-1 帧到第 frame_count 帧的 IMU 约束在累积）
         // 当frame_count为0时，用第一个IMU数据初始化pre_integrations[0]，但不进行预积分和状态传播
-        // 当frame_count大于0时，pre_integrations[frame_count]就用上一帧图像对应的img_t的IMU数据进行初始化
+        // 当frame_count大于0时，pre_integrations[frame_count]就用上一帧图像对应的img_t的IMU数据(非严格对应)进行初始化
         // tmp_pre_integration：临时预积分（常用于失败重启/重求解/非线性迭代中的快速尝试）
-        // Bas[j], Bgs[j]：第 j 帧的加速度计/陀螺偏置估计（滑窗状态的一部分）
+        // Bas[j], Bgs[j]：滑窗中第 j 帧的加速度计/陀螺偏置估计（滑窗状态的一部分）
         pre_integrations[frame_count] = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]};
     }
     // 第一帧图像数据不需要进行预积分，因为预积分是用来进行相邻两图像帧之间的约束
