@@ -471,33 +471,37 @@ void FeatureManager::removeOutlier(set<int> &outlierIndex)
     }
 }
 
+// 边缘化掉最老帧时，处理特征点被观测的帧号，并将起始帧是最老帧的特征点的深度值转移到原先第二老的帧的相机坐标系下
+// marg_R、marg_P是滑动窗口中原先最老的帧（被边缘化掉的帧）的位姿(c->w)
+// new_R、new_P是滑动窗口中原先第二老的帧（现在是最老的帧）的位姿(c->w)
 void FeatureManager::removeBackShiftDepth(Eigen::Matrix3d marg_R, Eigen::Vector3d marg_P, Eigen::Matrix3d new_R, Eigen::Vector3d new_P)
 {
+    // 对feature容器进行更新，因为最老帧被marg掉了
     for (auto it = feature.begin(), it_next = feature.begin();
          it != feature.end(); it = it_next)
     {
         it_next++;
 
-        if (it->start_frame != 0)
+        if (it->start_frame != 0) // 观测到该特征点的起始帧不是最老帧（即0帧），则将起始帧号减一，因为在下面代码中会移除0帧
             it->start_frame--;
-        else
+        else // 观测到该特征点的起始帧是被边缘化的最老帧
         {
-            Eigen::Vector3d uv_i = it->feature_per_frame[0].point;  
-            it->feature_per_frame.erase(it->feature_per_frame.begin());
-            if (it->feature_per_frame.size() < 2)
+            Eigen::Vector3d uv_i = it->feature_per_frame[0].point; // 该特征点在最老帧（被边缘化的帧）相机坐标系下的去畸变后的相机归一化平面坐标 
+            it->feature_per_frame.erase(it->feature_per_frame.begin()); // 移除边缘化的最老帧的信息
+            if (it->feature_per_frame.size() < 2) // 如果该特征点只被最老帧和第二老帧观测到，则移除该特征
             {
                 feature.erase(it);
                 continue;
             }
             else
-            {
-                Eigen::Vector3d pts_i = uv_i * it->estimated_depth;
-                Eigen::Vector3d w_pts_i = marg_R * pts_i + marg_P;
-                Eigen::Vector3d pts_j = new_R.transpose() * (w_pts_i - new_P);
-                double dep_j = pts_j(2);
+            {   // estimated_depth 本身就是位于起始帧下的深度值
+                Eigen::Vector3d pts_i = uv_i * it->estimated_depth; // 该特征点在最老帧（被边缘化的帧）相机坐标系下的的三维坐标
+                Eigen::Vector3d w_pts_i = marg_R * pts_i + marg_P;  // 该特征点在世界坐标系下的三维坐标
+                Eigen::Vector3d pts_j = new_R.transpose() * (w_pts_i - new_P); // 将其转换到第二老的帧(滑窗后的第0帧)相机坐标系下的三维坐标
+                double dep_j = pts_j(2); // 深度值
                 if (dep_j > 0)
                     it->estimated_depth = dep_j;
-                else
+                else // 无效的深度值，重置为初始值
                     it->estimated_depth = INIT_DEPTH;
             }
         }
@@ -511,6 +515,7 @@ void FeatureManager::removeBackShiftDepth(Eigen::Matrix3d marg_R, Eigen::Vector3
     }
 }
 
+// 边缘化最老帧时，直接将路标点所保存的帧号向前滑动（窗口中处理的是相邻的帧）
 void FeatureManager::removeBack()
 {
     for (auto it = feature.begin(), it_next = feature.begin();
@@ -518,35 +523,37 @@ void FeatureManager::removeBack()
     {
         it_next++;
 
-        if (it->start_frame != 0)
+        if (it->start_frame != 0) // 观测到该路标点的起始帧不是最老帧（滑窗中的0帧），则将起始帧号减一，因为在下面代码中会移除0帧
             it->start_frame--;
-        else
+        else  // 观测到该路标点的起始帧是最老帧，则直接删除该路标点在最老帧的观测数据，
         {
-            it->feature_per_frame.erase(it->feature_per_frame.begin());
+            it->feature_per_frame.erase(it->feature_per_frame.begin()); // 移除0帧的信息
             if (it->feature_per_frame.size() == 0)
-                feature.erase(it);
+                feature.erase(it); // 如果移除了之后为空，则删除该路标点
         }
     }
 }
 
+// 边缘化次新帧时，对路标点在次新帧的信息进行移除处理
+// 传入的frame_count其实就是WINDOW_SIZE
 void FeatureManager::removeFront(int frame_count)
 {
     for (auto it = feature.begin(), it_next = feature.begin(); it != feature.end(); it = it_next)
     {
         it_next++;
 
-        if (it->start_frame == frame_count)
+        if (it->start_frame == frame_count) // 观测到该路标点的起始帧是当前最新帧（frame_count帧），则将起始帧号减一，这样就将其滑动成为了次新帧
         {
             it->start_frame--;
         }
         else
         {
             int j = WINDOW_SIZE - 1 - it->start_frame;
-            if (it->endFrame() < frame_count - 1)
+            if (it->endFrame() < frame_count - 1) // 如果该路标点在次新帧之前就已经跟踪结束了，则什么都不做
                 continue;
-            it->feature_per_frame.erase(it->feature_per_frame.begin() + j);
+            it->feature_per_frame.erase(it->feature_per_frame.begin() + j); // 如果该路标点在次新帧中仍被跟踪观测到了，则移除次新帧的信息
             if (it->feature_per_frame.size() == 0)
-                feature.erase(it);
+                feature.erase(it); // 如果移除次新帧信息之后图像观测为空，则删除该路标点
         }
     }
 }

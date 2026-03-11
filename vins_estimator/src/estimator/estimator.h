@@ -122,7 +122,7 @@ class Estimator
 
     Matrix3d back_R0, last_R, last_R0;
     Vector3d back_P0, last_P, last_P0;
-    double Headers[(WINDOW_SIZE + 1)];
+    double Headers[(WINDOW_SIZE + 1)]; // 滑窗中的图像帧的时间戳
 
     IntegrationBase *pre_integrations[(WINDOW_SIZE + 1)];
     Vector3d acc_0, gyr_0; // 上一时刻的IMU测量值,基于IMU坐标系(用于中值法/预积分的左端点)

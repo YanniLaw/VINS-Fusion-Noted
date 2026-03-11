@@ -301,7 +301,7 @@ void Estimator::processMeasurements()
         if(!featureBuf.empty())
         {
             feature = featureBuf.front();
-            curTime = feature.first + td;
+            curTime = feature.first + td; // 图像时间戳加上IMU和图像的时间差，得到对齐后的时间戳。后面获取的是对齐后的IMU数据
             // 等待直到IMU数据足够
             // VIO 的状态递推依赖IMU。要处理时刻tk的图像，必须拥有直到tk时刻为止的所有IMU数据
             // 如果图像来了，但IMU数据还没传过来（或者IMU频率不够快、网络延迟），这里会死循环等待，直到IMU数据“追上”图像时间
@@ -323,7 +323,8 @@ void Estimator::processMeasurements()
             // 数据准备: 取出IMU区间数据，消费一帧图像特征
             mBuf.lock();
             if(USE_IMU)
-                // 取出两帧图像之间的所有IMU数据, 如果是第一帧图像，则取出该图像时间戳之前的所有IMU数据
+                // 取出两帧图像之间的所有IMU数据(上一帧到当前帧)
+                // 如果是第一帧图像，则取出该图像时间戳之前的所有IMU数据
                 // 每次调用该函数的时候，当前帧取的accVector第一个数据都是上一帧取的accVector最后一个数据
                 getIMUInterval(prevTime, curTime, accVector, gyrVector);
 
@@ -332,7 +333,7 @@ void Estimator::processMeasurements()
 
             if(USE_IMU)
             {
-                if(!initFirstPoseFlag) // IMU姿态初始化(需要先检查是否为静止)
+                if(!initFirstPoseFlag) // IMU姿态初始化(需要先检查是否为静止?)
                     initFirstIMUPose(accVector);
                 // 预积分两帧图像之间的所有IMU数据，并推进状态到当前图像时刻curTime(而不是IMU最后一个样本时刻)
                 // 如果是第一帧图像，则从第一帧IMU时刻推进到第一帧图像时刻curTime
@@ -487,7 +488,7 @@ void Estimator::processIMU(double t, double dt, const Vector3d &linear_accelerat
  * 2. 所有(左右双目)特征点去畸变前 在图像平面的像素坐标(u,v);
  * 3. 所有(左右双目)特征点去畸变后 在相机归一化平面的速度(vx, vy).
  * @param image 提取出的图像特征数据
- * @param header 
+ * @param header 图像帧时间戳
  */
 void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const double header)
 {
@@ -517,8 +518,13 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     // 这里的acc_0、gyr_0是在当前图像帧时间戳img_t处对应的imu观测量
     // 其实并不是严格对应，因为IMU数据是离散的，而图像时间戳通常落在两个IMU样本之间 参考取imu区间的函数 getIMUInterval() 会大于时间戳
     // 是否考虑进行插值???
+    // 用当前帧的数据进行初始化，下一帧图像到来时，就可以用当前帧到下一帧的imu数据来进行预积分了
     tmp_pre_integration = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]};
 
+    // ESTIMATE_EXTRINSIC 几个值的含义：
+    // 0: 已经提供了外参，不需要在线标定了，直接进入初始化阶段
+    // 1: 已经成功标定出了外参，后续继续在线优化外参
+    // 2: 没有提供外参，需要进行在线标定，等待标定成功后再进入初始化阶段
     if(ESTIMATE_EXTRINSIC == 2) // 没有提供外参， 进行外参在线标定
     {
         ROS_INFO("calibrating extrinsic param, rotation movement is needed");
@@ -584,7 +590,7 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
                     slideWindow();
                     ROS_INFO("Initialization finish!");
                 }
-                else // 如果此次初始化失败，则要直接滑动窗口丢掉一帧，然后再进行初始化，直到初始化完成
+                else // 如果截止到当前帧初始化失败，则要直接滑动窗口丢掉一帧，然后再进行初始化，直到初始化完成
                     slideWindow();
             }
         }
@@ -647,7 +653,7 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
         }
 
     }
-    else
+    else // 初始化完成后，系统进入正常的非线性优化阶段
     {
         TicToc t_solve;
         if(!USE_IMU)
@@ -1529,14 +1535,14 @@ void Estimator::optimization()
 void Estimator::slideWindow()
 {
     TicToc t_margin;
-    if (marginalization_flag == MARGIN_OLD)
+    if (marginalization_flag == MARGIN_OLD) // 边缘化滑动窗口中的第0帧，即最老的一帧
     {
         double t_0 = Headers[0];
         back_R0 = Rs[0];
         back_P0 = Ps[0];
         if (frame_count == WINDOW_SIZE)
         {
-            for (int i = 0; i < WINDOW_SIZE; i++)
+            for (int i = 0; i < WINDOW_SIZE; i++) // 依次把滑动窗口内的信息前移
             {
                 Headers[i] = Headers[i + 1];
                 Rs[i].swap(Rs[i + 1]);
@@ -1556,7 +1562,7 @@ void Estimator::slideWindow()
             }
             Headers[WINDOW_SIZE] = Headers[WINDOW_SIZE - 1];
             Ps[WINDOW_SIZE] = Ps[WINDOW_SIZE - 1];
-            Rs[WINDOW_SIZE] = Rs[WINDOW_SIZE - 1];
+            Rs[WINDOW_SIZE] = Rs[WINDOW_SIZE - 1]; // 现在滑动窗口中的末尾两帧数据都是最新帧信息，最老帧的信息已经被替换了
 
             if(USE_IMU)
             {
@@ -1564,15 +1570,16 @@ void Estimator::slideWindow()
                 Bas[WINDOW_SIZE] = Bas[WINDOW_SIZE - 1];
                 Bgs[WINDOW_SIZE] = Bgs[WINDOW_SIZE - 1];
 
+                // 新实例化一个IMU预积分对象给下一个最新一帧，这里只是使用原先的最新一帧的信息作为下一次最新一帧的初始值
                 delete pre_integrations[WINDOW_SIZE];
                 pre_integrations[WINDOW_SIZE] = new IntegrationBase{acc_0, gyr_0, Bas[WINDOW_SIZE], Bgs[WINDOW_SIZE]};
-
+                // 清空滑动窗口中最末尾帧的IMU预积分缓存数据，给到下一次最新一帧使用
                 dt_buf[WINDOW_SIZE].clear();
                 linear_acceleration_buf[WINDOW_SIZE].clear();
                 angular_velocity_buf[WINDOW_SIZE].clear();
             }
 
-            if (true || solver_flag == INITIAL)
+            if (true || solver_flag == INITIAL) // 删除掉all_image_frame存的最老帧的IMU预积分信息
             {
                 map<double, ImageFrame>::iterator it_0;
                 it_0 = all_image_frame.find(t_0);
@@ -1582,36 +1589,41 @@ void Estimator::slideWindow()
             slideWindowOld();
         }
     }
-    else
+    else // 删除滑动窗口中的第 WINDOW_SIZE -1 帧，即次新帧 (本质是用最新帧的信息覆盖掉次新帧)
     {
         if (frame_count == WINDOW_SIZE)
         {
             Headers[frame_count - 1] = Headers[frame_count];
             Ps[frame_count - 1] = Ps[frame_count];
-            Rs[frame_count - 1] = Rs[frame_count];
+            Rs[frame_count - 1] = Rs[frame_count]; // 相当于把次新帧的信息替换成最新帧的信息，滑动窗口中的末尾两帧数据都是最新帧信息，次新帧的信息已经被替换了
 
             if(USE_IMU)
             {
-                for (unsigned int i = 0; i < dt_buf[frame_count].size(); i++)
+                // 因为这里要将次新帧的视觉信息直接丢掉，但与其关联的IMU测量数据还要保留，从而保证IMU预积分的连贯性；
+                // 因此就需要将当前最新帧的IMU数据合并到次新帧中。
+                for (unsigned int i = 0; i < dt_buf[frame_count].size(); i++) // 遍历当前最新帧对应的IMU测量信息，它记录了从frame_count-1到frame_count帧之间的所有IMU数据
                 {
-                    double tmp_dt = dt_buf[frame_count][i];
+                    double tmp_dt = dt_buf[frame_count][i]; // dt
                     Vector3d tmp_linear_acceleration = linear_acceleration_buf[frame_count][i];
                     Vector3d tmp_angular_velocity = angular_velocity_buf[frame_count][i];
-
+                    // 因为将要删除掉当前次新帧，所以将frame_count-2到frame_count-1之间的IMU预积分继续进行计算，预积分到frame_count(当前帧)
+                    // 即转换成了当前最新帧和前面两帧之间的IMU预积分
                     pre_integrations[frame_count - 1]->push_back(tmp_dt, tmp_linear_acceleration, tmp_angular_velocity);
-
+                    // 将当前最新帧的IMU数据都转移到滑窗中的次新帧中
                     dt_buf[frame_count - 1].push_back(tmp_dt);
                     linear_acceleration_buf[frame_count - 1].push_back(tmp_linear_acceleration);
                     angular_velocity_buf[frame_count - 1].push_back(tmp_angular_velocity);
                 }
-
+                // 用当前最新帧的数据替代当前次新帧
+                // 因为删除次新帧之后，当前最新帧就将做为下一帧的次新帧，所以这里提前把它的数据放置在了倒数第二帧
                 Vs[frame_count - 1] = Vs[frame_count];
                 Bas[frame_count - 1] = Bas[frame_count];
                 Bgs[frame_count - 1] = Bgs[frame_count];
-
+                // 构造新帧的预积分，给下一帧新图像进入预留一个干净的 IMU 预积分起点
                 delete pre_integrations[WINDOW_SIZE];
                 pre_integrations[WINDOW_SIZE] = new IntegrationBase{acc_0, gyr_0, Bas[WINDOW_SIZE], Bgs[WINDOW_SIZE]};
-
+                // 因为前面已经把当前最新帧的信息覆盖了倒数第二帧，所以这里转换成了删除最后一帧，直接把最后一帧清除即可
+                // 清除掉这些数据之后，给到下一帧使用，下一帧的IMU预积分就相当于从当前最新帧开始积累的了
                 dt_buf[WINDOW_SIZE].clear();
                 linear_acceleration_buf[WINDOW_SIZE].clear();
                 angular_velocity_buf[WINDOW_SIZE].clear();
@@ -1621,26 +1633,40 @@ void Estimator::slideWindow()
     }
 }
 
+//real marginalization is removed in solve_ceres()
 void Estimator::slideWindowNew()
 {
     sum_of_front++;
     f_manager.removeFront(frame_count);
 }
 
+//real marginalization is removed in solve_ceres()
 void Estimator::slideWindowOld()
 {
-    sum_of_back++;
+    sum_of_back++; // 这里的sum_of_back和sum_of_front是为了统计滑动窗口中前移和后移的次数，主要是为了在后续的代码中判断是否需要删除掉all_image_frame中存的最老帧的IMU预积分信息
+    // 为什么要shift depth? 
+    // VINS 里的特征采用的是逆深度参数化，而且这个逆深度是相对于首观测帧定义的，
+    // 假设一个特征最早是在被删除的老帧中第一次看到的，那么删掉这帧后会有问题：
+    // 1. 这个特征还在后续帧中被观测到; 2. 但它的参数却绑定在一个已经不存在的参考坐标系上.
+    // 所以必须把它“转挂”到新的参考帧上，才能继续被优化使用。
+    // 在滑动窗口前移后，原先的首观测帧被边缘化掉了，新的首观测帧变成了之前滑动窗口中的第二老的帧，
+    // 所以需要把之前以原先首观测帧为参考坐标系的逆深度信息转换到以新的首观测帧为参考坐标系下，这样才能保证滑动窗口中所有特征的逆深度信息都在同一个坐标系下，才能进行后续的优化
 
+    // 为什么只在 NON_LINEAR 时 shift depth? 
+    // 因为只有进入正常非线性优化阶段后，当前位姿、深度、外参这些量才足够可信，可以做稳定的坐标变换
+    // 在初始化阶段，状态还没完全收敛，直接 shift depth 容易引入错误，所以接删掉最老观测，不做深度重投影
     bool shift_depth = solver_flag == NON_LINEAR ? true : false;
     if (shift_depth)
     {
         Matrix3d R0, R1;
         Vector3d P0, P1;
-        R0 = back_R0 * ric[0];
+        // back_R0、back_P0是滑动窗口中原先最老的帧（被边缘化掉的帧）对应的IMU的位姿变换T^w_b0
+        // 这里的Rs[0]、Ps[0]是经过滑窗之后的第0帧（即是滑窗前最老帧后面的那1帧，滑动窗口中第二老的帧）对应的IMU的位姿变换T^w_b1
+        R0 = back_R0 * ric[0]; 
         R1 = Rs[0] * ric[0];
         P0 = back_P0 + back_R0 * tic[0];
         P1 = Ps[0] + Rs[0] * tic[0];
-        f_manager.removeBackShiftDepth(R0, P0, R1, P1);
+        f_manager.removeBackShiftDepth(R0, P0, R1, P1); // 其实就是重新更新特征点的深度值
     }
     else
         f_manager.removeBack();
