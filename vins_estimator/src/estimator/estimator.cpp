@@ -744,6 +744,7 @@ bool Estimator::initialStructure()
         }
     }
     // global sfm
+    // 先通过纯视觉SFM求解滑窗内所有帧的位姿，以及所有路标点的3D位置
     Quaterniond Q[frame_count + 1]; // 记录初始化时滑窗中每一帧的姿态(相对于起始帧)
     Vector3d T[frame_count + 1];    // 记录初始化时滑窗中每一帧的位置(相对于起始帧)
     map<int, Vector3d> sfm_tracked_points; // 记录初始化时所有成功三角化的路标点(相对于起始帧), key: feature_id, value: 3d point
@@ -768,7 +769,7 @@ bool Estimator::initialStructure()
     int l;
     // 从滑窗中找到距离当前帧具有足够视差的参考帧l，并由本质矩阵恢复出R、t作为初始值
     // l帧指的是，在滑动窗口中，从第一帧开始，首个满足与当前帧的平均视差足够大的帧，并且它还会做为参考帧在下面的全局sfm中使用。（找出的这个l一般都等于0）
-    // 此处的relative_R，relative_T是当前帧到参考帧cl（l帧）的坐标变换R、t
+    // 此处的relative_R，relative_T是当前最新帧到参考帧cl（l帧）的坐标变换R、t
     if (!relativePose(relative_R, relative_T, l))
     {
         ROS_INFO("Not enough features or parallax; Move device around");
@@ -1584,14 +1585,14 @@ void Estimator::slideWindow()
                 map<double, ImageFrame>::iterator it_0;
                 it_0 = all_image_frame.find(t_0);
                 delete it_0->second.pre_integration;
-                all_image_frame.erase(all_image_frame.begin(), it_0);
+                all_image_frame.erase(all_image_frame.begin(), it_0); // 删除掉滑窗中最老帧以及之前可能存储的所有其他帧数据
             }
             slideWindowOld();
         }
     }
     else // 删除滑动窗口中的第 WINDOW_SIZE -1 帧，即次新帧 (本质是用最新帧的信息覆盖掉次新帧)
     {
-        if (frame_count == WINDOW_SIZE)
+        if (frame_count == WINDOW_SIZE) // 这种情况没有删除all_image_frame里面的数据
         {
             Headers[frame_count - 1] = Headers[frame_count];
             Ps[frame_count - 1] = Ps[frame_count];
