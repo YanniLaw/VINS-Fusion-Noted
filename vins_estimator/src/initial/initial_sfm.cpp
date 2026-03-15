@@ -250,8 +250,11 @@ bool GlobalSFM::construct(int frame_num, Quaterniond* q, Vector3d* T, int l,
 	// 兜底: 继续三角化其它未恢复的3d路标点。注意，这里恢复出来的路标点坐标都是基于滑窗中第l帧坐标系(参考帧)
 	for (int j = 0; j < feature_num; j++)
 	{
-		if (sfm_f[j].state == true)
+		if (sfm_f[j].state == true) // 前面triangulateTwoFrames已经三角化成功的点就会设置为true
 			continue;
+		// 三角化未成功的点，增加点的覆盖率
+		// 这里的三角化条件更宽松了，只要有两帧观测到这个点就三角化，不再要求必须有当前帧参与三角化了，增加成功率
+		// 但同时也更容易产生一些质量较差的点，后续BA时要注意加权重或者鲁棒核压制这些点的影响
 		if ((int)sfm_f[j].observation.size() >= 2) // 至少被两帧观测到才能三角化
 		{
 			Vector2d point0, point1;

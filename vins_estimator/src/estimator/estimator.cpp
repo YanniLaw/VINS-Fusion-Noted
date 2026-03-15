@@ -924,7 +924,8 @@ bool Estimator::visualInitialAlign()
         return false;
     }
 
-    // change state
+    // change state，更新滑动窗口中每一帧的位姿
+    // 此时的Ps[]、Rs[]是之前SFM求解出来的相对于参考帧l的位姿，还没有对齐到重力方向，也没有恢复出真实尺度
     for (int i = 0; i <= frame_count; i++) // 遍历当前滑动窗口中的所有图像帧
     {
         Matrix3d Ri = all_image_frame[Headers[i]].R; // 该图像帧时对应的IMU坐标系到相机帧l坐标系的旋转变换
@@ -934,13 +935,20 @@ bool Estimator::visualInitialAlign()
         all_image_frame[Headers[i]].is_key_frame = true;
     }
 
-    double s = (x.tail<1>())(0);
+    double s = (x.tail<1>())(0); // 尺度
+    // 重新传播滑窗中的预积分，前面更新的是all_image_frame每一帧的预积分
     for (int i = 0; i <= WINDOW_SIZE; i++) // 更新了陀螺仪的偏置Bgs之后，需要重新计算IMU预积分
     {
+        // acc_bias 线加速度计偏置在初始化过程中不考虑，所以传入零向量；gyro_bias 传入上面求解出来的陀螺仪偏置
         pre_integrations[i]->repropagate(Vector3d::Zero(), Bgs[i]);
     }
+    // 施加绝对尺度与坐标系原点平移
+    // 1. 赋予尺度 (s * Ps[i])：Ps[i] 来自前面的视觉 SFM，只是 up-to-scale, 将单目视觉中无量纲的平移乘上求出的真实尺度s，转换为米 (meters);
+    // 2. 相机系到 IMU 系的转移 (- Rs[i] * TIC[0]): SfM 算出的位姿是相机的位姿，而 VIO 追踪的核心是 IMU 的位姿（Body 坐标系）;
+    // 3. 对齐原点 (- (s * Ps[0] - Rs[0] * TIC[0]))：减去第0帧变换后的位置。这相当于强制把滑窗内的第 0 帧作为世界坐标系的原点(0, 0, 0)
     for (int i = frame_count; i >= 0; i--)
         Ps[i] = s * Ps[i] - Rs[i] * TIC[0] - (s * Ps[0] - Rs[0] * TIC[0]);
+    // 恢复出每一帧的速度，Vs[i] 来自前面求解出来的视觉-惯性对齐的结果
     int kv = -1;
     map<double, ImageFrame>::iterator frame_i;
     for (frame_i = all_image_frame.begin(); frame_i != all_image_frame.end(); frame_i++)
