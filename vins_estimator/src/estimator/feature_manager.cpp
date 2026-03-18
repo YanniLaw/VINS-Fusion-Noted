@@ -200,9 +200,23 @@ void FeatureManager::clearDepth()
         it_per_id.estimated_depth = -1;
 }
 
+/**
+ * @brief 获取滑动窗口中被多帧(>=4)跟踪到过的特征的数量，并将这些特征的深度值以向量形式返回（注意是逆深度）
+ *  这里为什么用逆深度？
+ * 1. 压缩状态变量维度（降低计算量）: 直接优化每个特征点的3D位置需要为每个点维护三个参数（x, y, z），而优化深度的倒数只需要一个参数。
+ *    这在滑动窗口中可以显著减少状态变量的维度，降低优化的计算复杂度。
+ * 2. 数值稳定性更好，尤其对远点和小视差点：直接优化深度值可能会导致数值不稳定（尤其是当深度较大时），
+ *    而优化深度的倒数可以使问题更稳定，且在某些情况下更适合优化器的收敛特性。
+ *    普通深度z对远点会变得很大，线性化时很容易病态；而逆深度λ=1/z对远点会自然接近0，甚至“接近无穷远”的点也还能用一个接近0的小量来表示。
+ *    对低视差、远距离特征的条件数更友好，优化器更容易处理。
+ * 3. 和首观测帧锚定的重投影模型更匹配: VINS 不是把地图点当成独立对象满世界漂，而是把特征“挂”在它的首观测帧上，再通过后续帧的重投影来约束这个标量.
+ * 4. 更适合滑窗中的 Schur 消元和边缘化: VINS-Fusion 的窗口里，最老帧会不断被边缘化。若特征是用全局 3D 点参数化，很多点会和大量历史位姿强耦合;
+ *    而用 host-frame inverse depth，特征和“首观测帧 + 后续少数观测帧”之间的关系更局部，做 Schur 补和先验传递更方便
+ * @return VectorXd 
+ */
 VectorXd FeatureManager::getDepthVector()
 {
-    VectorXd dep_vec(getFeatureCount());
+    VectorXd dep_vec(getFeatureCount()); // 滑动窗口中被多帧(>=4)跟踪到过的特征点的数量
     int feature_index = -1;
     for (auto &it_per_id : feature)
     {
@@ -210,7 +224,7 @@ VectorXd FeatureManager::getDepthVector()
         if (it_per_id.used_num < 4)
             continue;
 #if 1
-        dep_vec(++feature_index) = 1. / it_per_id.estimated_depth;
+        dep_vec(++feature_index) = 1. / it_per_id.estimated_depth; // 逆深度
 #else
         dep_vec(++feature_index) = it_per_id->estimated_depth;
 #endif
@@ -280,24 +294,44 @@ bool FeatureManager::solvePoseByPnP(Eigen::Matrix3d &R, Eigen::Vector3d &P,
     return true;
 }
 
+/**
+ * @brief 利用“已有深度的老特征”构造 3D–2D 对应，用 PnP(Perspective-n-Point) 算法求解当前帧的初始位姿
+ * 当系统已经有了一些带深度的 3D 特征点（比如通过双目第一帧三角化出来的点），新来了一帧图像时，
+ * 我们就可以利用这些已知 3D 点在当前帧的 2D 投影位置，反推算出当前帧相机的空间位姿
+ * 只有在双目模式下才会调用该函数
+ * 总而言之，就是利用当前帧跟踪到的“老特征点”来进行PNP求解当前帧的位姿(初始解，后面会进行优化的)
+ * @param frameCnt 当前帧在滑窗中的id
+ * @param Ps 
+ * @param Rs 
+ * @param tic 外参
+ * @param ric 
+ */
 void FeatureManager::initFramePoseByPnP(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vector3d tic[], Matrix3d ric[])
 {
-
+    // 需要第一帧数据在初始化时通过双目三角化得到路标点的深度，
+    // 所以第二帧才能使用 PnP 算法来求解当前帧的位姿
     if(frameCnt > 0)
     {
         vector<cv::Point2f> pts2D;
         vector<cv::Point3f> pts3D;
         for (auto &it_per_id : feature)
         {
-            if (it_per_id.estimated_depth > 0)
+            if (it_per_id.estimated_depth > 0) // 已经三角化计算出了深度信息
             {
+                // 该特征在当前帧 frameCnt 里还能看到
+                // 如果这条特征从 start_frame 开始被连续跟踪，那么它在当前帧里的观测应该是 feature_per_frame[index]
+                // 如果没有当前帧的 2D 观测，这个点就无法用来构建 3D-2D 的 PnP 匹配对，直接被过滤掉
                 int index = frameCnt - it_per_id.start_frame;
-                if((int)it_per_id.feature_per_frame.size() >= index + 1)
+                if((int)it_per_id.feature_per_frame.size() >= index + 1) // 不符合这个条件说明该特征点在当前帧没有观测数据，无法用于 PnP 求解
                 {
+                    // 先得到该点在首观测左相机坐标系中的三维坐标，再通过外参变换到首帧观测imu坐标系
+                    // feature_per_frame[0] 是该特征点在首观测帧的观测数据，point是归一化平面坐标，estimated_depth是深度
                     Vector3d ptsInCam = ric[0] * (it_per_id.feature_per_frame[0].point * it_per_id.estimated_depth) + tic[0];
+                    // 再通过首观测帧的 IMU 位姿变到世界系
                     Vector3d ptsInWorld = Rs[it_per_id.start_frame] * ptsInCam + Ps[it_per_id.start_frame];
 
                     cv::Point3f point3d(ptsInWorld.x(), ptsInWorld.y(), ptsInWorld.z());
+                    // 当前帧左目的2d观测
                     cv::Point2f point2d(it_per_id.feature_per_frame[index].point.x(), it_per_id.feature_per_frame[index].point.y());
                     pts3D.push_back(point3d);
                     pts2D.push_back(point2d); 
@@ -306,11 +340,11 @@ void FeatureManager::initFramePoseByPnP(int frameCnt, Vector3d Ps[], Matrix3d Rs
         }
         Eigen::Matrix3d RCam;
         Eigen::Vector3d PCam;
-        // trans to w_T_cam
+        // trans to w_T_cam  用上一帧的位姿作为初始值
         RCam = Rs[frameCnt - 1] * ric[0];
         PCam = Rs[frameCnt - 1] * tic[0] + Ps[frameCnt - 1];
 
-        if(solvePoseByPnP(RCam, PCam, pts2D, pts3D))
+        if(solvePoseByPnP(RCam, PCam, pts2D, pts3D)) // PNP求解的是 当前左目在世界系中的位姿
         {
             // trans to w_T_imu
             Rs[frameCnt] = RCam * ric[0].transpose(); 
@@ -323,24 +357,36 @@ void FeatureManager::initFramePoseByPnP(int frameCnt, Vector3d Ps[], Matrix3d Rs
     }
 }
 
+/**
+ * @brief 对还没有深度信息的路标点进行三角化求深度（SVD分解）
+ * 其实是一个灵活的深度计算策略——双目靠空间基线，单目靠时间基线，观测多时上 SVD 求最优解
+ * 在VINS-Fusion 的后端里，特征是按“首观测帧的逆深度”进入滑窗状态的，所以这里不是在求最终优化结果，而是在给后续非线性优化提供一个初始depth seed
+ * @param frameCnt 当前帧在滑窗中的id
+ * @param Ps 
+ * @param Rs 
+ * @param tic 相机系到imu系的平移向量
+ * @param ric 相机系到imu系的旋转矩阵
+ */
 void FeatureManager::triangulate(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vector3d tic[], Matrix3d ric[])
 {
+    // 遍历滑窗中的每个路标点，求出该路标点在它start_frame帧坐标系下的深度。
+    // 在初始化恢复出尺度s之后，Ps[]是带有尺度的平移，因此这里求出的深度是真实的物理深度
     for (auto &it_per_id : feature)
     {
-        if (it_per_id.estimated_depth > 0)
+        if (it_per_id.estimated_depth > 0) // 该路标点的深度值如果大于0，说明该点已被三角化过了
             continue;
-
+        // 双目模式下，同一时刻直接三角化(因为双目同一时刻两帧图像之间的基线是固定的，三角化结果更稳定)
         if(STEREO && it_per_id.feature_per_frame[0].is_stereo)
         {
-            int imu_i = it_per_id.start_frame;
-            Eigen::Matrix<double, 3, 4> leftPose;
-            Eigen::Vector3d t0 = Ps[imu_i] + Rs[imu_i] * tic[0];
-            Eigen::Matrix3d R0 = Rs[imu_i] * ric[0];
-            leftPose.leftCols<3>() = R0.transpose();
+            int imu_i = it_per_id.start_frame; // 直接用首帧观测进行三角化
+            Eigen::Matrix<double, 3, 4> leftPose; // 左目
+            Eigen::Vector3d t0 = Ps[imu_i] + Rs[imu_i] * tic[0]; // t_w_c = t_w_i + R_w_i * t_i_c
+            Eigen::Matrix3d R0 = Rs[imu_i] * ric[0];  // R_w_c = R_w_i * R_i_c
+            leftPose.leftCols<3>() = R0.transpose(); // 下面是求T_c_w
             leftPose.rightCols<1>() = -R0.transpose() * t0;
             //cout << "left pose " << leftPose << endl;
 
-            Eigen::Matrix<double, 3, 4> rightPose;
+            Eigen::Matrix<double, 3, 4> rightPose; // 右目
             Eigen::Vector3d t1 = Ps[imu_i] + Rs[imu_i] * tic[1];
             Eigen::Matrix3d R1 = Rs[imu_i] * ric[1];
             rightPose.leftCols<3>() = R1.transpose();
@@ -349,15 +395,15 @@ void FeatureManager::triangulate(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vec
 
             Eigen::Vector2d point0, point1;
             Eigen::Vector3d point3d;
-            point0 = it_per_id.feature_per_frame[0].point.head(2);
+            point0 = it_per_id.feature_per_frame[0].point.head(2); // 因为是归一化的坐标
             point1 = it_per_id.feature_per_frame[0].pointRight.head(2);
             //cout << "point0 " << point0.transpose() << endl;
             //cout << "point1 " << point1.transpose() << endl;
 
             triangulatePoint(leftPose, rightPose, point0, point1, point3d);
             Eigen::Vector3d localPoint;
-            localPoint = leftPose.leftCols<3>() * point3d + leftPose.rightCols<1>();
-            double depth = localPoint.z();
+            localPoint = leftPose.leftCols<3>() * point3d + leftPose.rightCols<1>(); // 把三角化得到的世界点重新变回左相机坐标系
+            double depth = localPoint.z(); // depth就是该路标点在首观测帧的左目坐标系下的z值，也就是深度
             if (depth > 0)
                 it_per_id.estimated_depth = depth;
             else
@@ -369,15 +415,18 @@ void FeatureManager::triangulate(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vec
             */
             continue;
         }
-        else if(it_per_id.feature_per_frame.size() > 1)
+        else if(it_per_id.feature_per_frame.size() > 1) // 单目模式下，该路标点至少被两帧观测到过，用前后两帧进行快速三角化
         {
-            int imu_i = it_per_id.start_frame;
+            // 用该特征的前两次观测去做三角化
+            // 它只用前两次观测，没用整条轨迹。所以这不是最优多视图三角化，而是一个“够快够用”的初始值生成器
+            // 它默认第二个观测就是 imu_i + 1 这帧
+            int imu_i = it_per_id.start_frame; // 首帧观测
             Eigen::Matrix<double, 3, 4> leftPose;
             Eigen::Vector3d t0 = Ps[imu_i] + Rs[imu_i] * tic[0];
             Eigen::Matrix3d R0 = Rs[imu_i] * ric[0];
             leftPose.leftCols<3>() = R0.transpose();
             leftPose.rightCols<1>() = -R0.transpose() * t0;
-
+            // 第二帧观测，默认就是首帧观测的下一帧
             imu_i++;
             Eigen::Matrix<double, 3, 4> rightPose;
             Eigen::Vector3d t1 = Ps[imu_i] + Rs[imu_i] * tic[0];
@@ -391,7 +440,7 @@ void FeatureManager::triangulate(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vec
             point1 = it_per_id.feature_per_frame[1].point.head(2);
             triangulatePoint(leftPose, rightPose, point0, point1, point3d);
             Eigen::Vector3d localPoint;
-            localPoint = leftPose.leftCols<3>() * point3d + leftPose.rightCols<1>();
+            localPoint = leftPose.leftCols<3>() * point3d + leftPose.rightCols<1>(); // 将三角化结果变到首帧观测的左相机坐标系
             double depth = localPoint.z();
             if (depth > 0)
                 it_per_id.estimated_depth = depth;
@@ -404,6 +453,9 @@ void FeatureManager::triangulate(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vec
             */
             continue;
         }
+        // 下面的内容似乎走不到哦  这里是原来VINS MONO的代码
+        // 多视角svd三角化，该路标点至少被四帧观测到过，才能进行三角化
+        // 当有多次观测时，直接使用简单的2帧三角化可能精度不够，系统会使用直接线性变换（DLT）结合 SVD 分解来求取最优解
         it_per_id.used_num = it_per_id.feature_per_frame.size();
         if (it_per_id.used_num < 4)
             continue;
@@ -418,7 +470,7 @@ void FeatureManager::triangulate(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vec
         Eigen::Matrix3d R0 = Rs[imu_i] * ric[0];
         P0.leftCols<3>() = Eigen::Matrix3d::Identity();
         P0.rightCols<1>() = Eigen::Vector3d::Zero();
-
+        // 每个视角贡献两条独立方程，把所有观测堆起来后，对 A 做 SVD，取最小奇异值对应的右奇异向量：
         for (auto &it_per_frame : it_per_id.feature_per_frame)
         {
             imu_j++;

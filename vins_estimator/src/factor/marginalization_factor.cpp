@@ -120,17 +120,17 @@ void MarginalizationInfo::preMarginalize()
 {
     for (auto it : factors)
     {
-        it->Evaluate();
-
-        std::vector<int> block_sizes = it->cost_function->parameter_block_sizes();
+        it->Evaluate(); // 计算每项约束因子对应的残差，以及该残差关于对应的优化变量的雅克比矩阵
+        // 将所有的优化变量块parameter_blocks综合起来，统一拷贝到parameter_block_data中
+        std::vector<int> block_sizes = it->cost_function->parameter_block_sizes(); // 该项约束因子对应的所有的优化变量块的维度大小globalSize
         for (int i = 0; i < static_cast<int>(block_sizes.size()); i++)
         {
-            long addr = reinterpret_cast<long>(it->parameter_blocks[i]);
+            long addr = reinterpret_cast<long>(it->parameter_blocks[i]); // 优化变量块的内存地址
             int size = block_sizes[i];
             if (parameter_block_data.find(addr) == parameter_block_data.end())
             {
                 double *data = new double[size];
-                memcpy(data, it->parameter_blocks[i], sizeof(double) * size);
+                memcpy(data, it->parameter_blocks[i], sizeof(double) * size); // 对原始优化变量块数据进行拷贝复制
                 parameter_block_data[addr] = data;
             }
         }
