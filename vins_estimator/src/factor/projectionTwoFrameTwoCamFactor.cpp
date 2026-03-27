@@ -14,6 +14,16 @@
 Eigen::Matrix2d ProjectionTwoFrameTwoCamFactor::sqrt_info; // 重投影误差的平方根信息矩阵
 double ProjectionTwoFrameTwoCamFactor::sum_t;
 
+/**
+ * @brief Construct a new Projection Two Frame Two Cam Factor:: Projection Two Frame Two Cam Factor object
+ * 
+ * @param _pts_i  该路标点在start_frame帧下的归一化相机坐标
+ * @param _pts_j  该路标点在当前帧下的归一化相机坐标
+ * @param _velocity_i  该路标点在start_frame帧相机归一化平面上的速度
+ * @param _velocity_j  该路标点在当前帧相机归一化平面上的速度
+ * @param _td_i  start_frame帧的imu-camera的同步时钟偏差
+ * @param _td_j  当前帧的imu-camera的同步时钟偏差
+ */
 ProjectionTwoFrameTwoCamFactor::ProjectionTwoFrameTwoCamFactor(const Eigen::Vector3d &_pts_i, const Eigen::Vector3d &_pts_j,
                                                                const Eigen::Vector2d &_velocity_i, const Eigen::Vector2d &_velocity_j,
                                                                const double _td_i, const double _td_j) : 
@@ -40,6 +50,8 @@ ProjectionTwoFrameTwoCamFactor::ProjectionTwoFrameTwoCamFactor(const Eigen::Vect
 #endif
 };
 
+// parameters[0~4]分别对应了优化变量块：para_Pose[i], para_Pose[j], para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]
+// 该函数返回计算出的残差residuals，以及雅克比矩阵jacobians
 bool ProjectionTwoFrameTwoCamFactor::Evaluate(double const *const *parameters, double *residuals, double **jacobians) const
 {
     TicToc tic_toc;
@@ -55,39 +67,66 @@ bool ProjectionTwoFrameTwoCamFactor::Evaluate(double const *const *parameters, d
     Eigen::Vector3d tic2(parameters[3][0], parameters[3][1], parameters[3][2]);
     Eigen::Quaterniond qic2(parameters[3][6], parameters[3][3], parameters[3][4], parameters[3][5]);
 
-    double inv_dep_i = parameters[4][0];
+    double inv_dep_i = parameters[4][0]; // 路标点的逆深度
 
-    double td = parameters[5][0];
+    double td = parameters[5][0];   // 相机-IMU的时钟偏差
 
+    // 在VIO系统中包含视觉传感器（相机）和惯性传感器(IMU)，系统对这两个传感器分别进行采样，
+    // 获得相应的数据（图像、IMU数据）与对应的采样时间戳（记录传感器测量值的瞬时时间），
+    // 通常，我们假设记录的采样时间戳就是传感器真实的采样时间点，比如相机曝光时刻（通常曝光持续几毫秒到几十毫秒，我们认为曝光时刻为曝光时续的中间时刻）
+    // 然而，由于硬件系统存在触发延时、曝光时间、数据传输延迟以及没有准确的同步时钟等问题，
+    // 物理世界中相同时刻的IMU、相机帧数据，其记录的时间戳与真实采样时间存在一个td的时间偏差。
+    // 在这里假设IMU的时间戳是准确的，图像数据的时间戳可能是有偏差的，所以这里的时间偏差就指的是IMU与相机数据之间的相对时间戳偏差。
+    // 这里假设时间偏差是一个未知的常数，并假设图像上特征点像素在短时间内以恒定速度在图像平面上移动（每个像素各自的运动是匀速的），
+    // 这就可以估计出在对应时间戳的特征点像素的位置，
+    // 先计算出每个特征点像素的移动速度，然后根据速度值提前补偿时间戳不对齐对图像特征点的位置影响；
+    // 这样就将相机与IMU的时间偏移td，转换为在图像平面上特征点位置的延迟。
+
+    // 在估计得到td之后，会利用该td对图像数据的时间戳进行补偿修正。
+    // pts_i/ pts_j 表示在真实采样时刻对应的特征位置，因为在前面已补偿过了图像数据的时间戳，
+    // 所以在这里，迭代优化的是新的时间间隔δtd，直至最后将δtd收敛到0。
+    // 随着δtd的减小，我们的假设（特征点在短时间隔内以恒定速度在图像平面上移动）越来越合理，
+    // 即使在开始时存在巨大的时间偏移（如数百毫秒），该过程也将逐渐地从粗略到精细地补偿它。 
+    // velocity_i是该角点在归一化平面的运动速度。
+    // 所以最后得到的pts_i_td是处理时间同步误差，角点在归一化平面的坐标。
+    // 这两行代码表示了对相机-IMU时间戳偏移的支持
     Eigen::Vector3d pts_i_td, pts_j_td;
     pts_i_td = pts_i - (td - td_i) * velocity_i;
     pts_j_td = pts_j - (td - td_j) * velocity_j;
-
+    // l路标点在ci帧的相机3D坐标P^ci_l
     Eigen::Vector3d pts_camera_i = pts_i_td / inv_dep_i;
+    // R^b_c * P^ci_l + p^b_c
     Eigen::Vector3d pts_imu_i = qic * pts_camera_i + tic;
+    // R^w_bi * ( R^b_c * P^ci_l + p^b_c ) + p^w_bi
     Eigen::Vector3d pts_w = Qi * pts_imu_i + Pi;
+    // R^bj_w * ( R^w_bi * ( R^b_c * P^ci_l + p^b_c ) + p^w_bi - p^w_bj )
     Eigen::Vector3d pts_imu_j = Qj.inverse() * (pts_w - Pj);
-    Eigen::Vector3d pts_camera_j = qic2.inverse() * (pts_imu_j - tic2);
+    // 计算出来的l路标点在cj帧的相机3D坐标P^cj_l = R^c_b * ( R^bj_w * ( R^w_bi * ( R^b_c * P^ci_l + p^b_c ) + p^w_bi - p^w_bj ) - p^b_c )
+    Eigen::Vector3d pts_camera_j = qic2.inverse() * (pts_imu_j - tic2); 
     Eigen::Map<Eigen::Vector2d> residual(residuals);
-
+    // 这里假设相机3D坐标pts_camera_j为(x,y,z)，像素观测量的反投影的相机归一化坐标pts_j_td为(u,v,1)
 #ifdef UNIT_SPHERE_ERROR 
+    // 实际上，真实的视觉向量差rc = w1 * b1 + w2 * b2 = (b1,b2) * (w1,w2)^T。其中w1、w2是标量系数，r、b1、b2是3维列向量。
+    // 这里的残差residual，其实是构成切平面的两个正交基的坐标(w1,w2)^T = (b1,b2)^T * rc。
+    // 为方便表示，这里将pts_camera_j的模长sqrt(x^2+y^2+z^2)记为norm，pts_j_td的模长sqrt(u^2+v^2+1)记为piexl_norm。
+    // 则残差residual表示为2维向量：tangent_base * (x/norm - u/piexl_norm, y/norm - v/piexl_norm, z/norm - 1/piexl_norm)^T
     residual =  tangent_base * (pts_camera_j.normalized() - pts_j_td.normalized());
 #else
     double dep_j = pts_camera_j.z();
-    residual = (pts_camera_j / dep_j).head<2>() - pts_j_td.head<2>();
+    residual = (pts_camera_j / dep_j).head<2>() - pts_j_td.head<2>(); // 残差residual表示为2维向量(x/z - u, y/z - v)^T
 #endif
 
     residual = sqrt_info * residual;
-
+    // 补偿了时间偏差后的视觉重投影残差的雅克比矩阵。优化变量块是两图像帧的[p^w_bi、q^w_bi]，[p^w_bj、q^w_bj]，[p^b_c、q^b_c]，[λl]，[td]
     if (jacobians)
     {
         Eigen::Matrix3d Ri = Qi.toRotationMatrix();
         Eigen::Matrix3d Rj = Qj.toRotationMatrix();
         Eigen::Matrix3d ric = qic.toRotationMatrix();
         Eigen::Matrix3d ric2 = qic2.toRotationMatrix();
-        Eigen::Matrix<double, 2, 3> reduce(2, 3);
+        Eigen::Matrix<double, 2, 3> reduce(2, 3); // 2x3，表示残差residual对pts_camera_j的导数
 #ifdef UNIT_SPHERE_ERROR
-        double norm = pts_camera_j.norm();
+        double norm = pts_camera_j.norm(); // 模长sqrt(x^2+y^2+z^2)
         Eigen::Matrix3d norm_jaco;
         double x1, x2, x3;
         x1 = pts_camera_j(0);
@@ -97,9 +136,15 @@ bool ProjectionTwoFrameTwoCamFactor::Evaluate(double const *const *parameters, d
                      - x1 * x2 / pow(norm, 3),            1.0 / norm - x2 * x2 / pow(norm, 3), - x2 * x3 / pow(norm, 3),
                      - x1 * x3 / pow(norm, 3),            - x2 * x3 / pow(norm, 3),            1.0 / norm - x3 * x3 / pow(norm, 3);
         reduce = tangent_base * norm_jaco;
+        // 残差r关于pts_camera_j(x,y,z)的导数为：tangent_base * 
+        // [ ((x/norm - u/piexl_norm) / x)`, ((x/norm - u/piexl_norm) / y)`, ((x/norm - u/piexl_norm) / z)` ] = [ 1/norm - x^2/norm^3, -x*y/norm^3, -x*z/norm^3 ]
+        // [ ((y/norm - v/piexl_norm) / x)`, ((y/norm - v/piexl_norm) / y)`, ((y/norm - v/piexl_norm) / z)` ] = [ -y*x/norm^3, 1/norm - y^2/norm^3, -y*z/norm^3 ]
+        // [ ((z/norm - 1/piexl_norm) / x)`, ((z/norm - 1/piexl_norm) / y)`, ((z/norm - 1/piexl_norm) / z)` ] = [ -z*x/norm^3, -z*y/norm^3, 1/norm - z^2/norm^3 ]
 #else
         reduce << 1. / dep_j, 0, -pts_camera_j(0) / (dep_j * dep_j),
             0, 1. / dep_j, -pts_camera_j(1) / (dep_j * dep_j);
+        // 残差r关于pts_camera_j(x,y,z)的导数为：[ ((x/z - u) / x)`, ((x/z - u) / y)`, ((x/z - u) / z)` ] = [ 1/z, 0, -x^2/z ]
+        //                                    [ ((y/z - v) / x)`, ((y/z - v) / y)`, ((y/z - v) / z)` ] = [ 0, 1/z, -y^2/z ]
 #endif
         reduce = sqrt_info * reduce;
 
@@ -210,7 +255,7 @@ void ProjectionTwoFrameTwoCamFactor::check(double **parameters)
     double inv_dep_i = parameters[4][0];
 
     double td = parameters[5][0];
-
+    //pts_i_td 处理时间同步误差时间后，角点在归一化平面的坐标。
     Eigen::Vector3d pts_i_td, pts_j_td;
     pts_i_td = pts_i - (td - td_i) * velocity_i;
     pts_j_td = pts_j - (td - td_j) * velocity_j;

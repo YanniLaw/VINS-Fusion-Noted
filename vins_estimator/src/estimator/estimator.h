@@ -127,9 +127,9 @@ class Estimator
     IntegrationBase *pre_integrations[(WINDOW_SIZE + 1)];
     Vector3d acc_0, gyr_0; // 上一时刻的IMU测量值,基于IMU坐标系(用于中值法/预积分的左端点)
 
-    vector<double> dt_buf[(WINDOW_SIZE + 1)];
-    vector<Vector3d> linear_acceleration_buf[(WINDOW_SIZE + 1)];
-    vector<Vector3d> angular_velocity_buf[(WINDOW_SIZE + 1)];
+    vector<double> dt_buf[(WINDOW_SIZE + 1)]; // 滑窗中的每一图像帧对应的IMU预积分的时间间隔
+    vector<Vector3d> linear_acceleration_buf[(WINDOW_SIZE + 1)]; // 滑窗中的每一图像帧对应的IMU预积分加速度数据
+    vector<Vector3d> angular_velocity_buf[(WINDOW_SIZE + 1)];    // 滑窗中的每一图像帧对应的IMU预积分角速度数据
 
     int frame_count; // 帧数目，从0开始计数,最大是 WINDOW_SIZE
     int sum_of_outlier, sum_of_back, sum_of_front, sum_of_invalid;
@@ -148,19 +148,19 @@ class Estimator
     vector<Vector3d> key_poses;
     double initial_timestamp;
 
-
-    double para_Pose[WINDOW_SIZE + 1][SIZE_POSE];
-    double para_SpeedBias[WINDOW_SIZE + 1][SIZE_SPEEDBIAS];
-    double para_Feature[NUM_OF_F][SIZE_FEATURE];
-    double para_Ex_Pose[2][SIZE_POSE];
+    // ceres中用的是double数组
+    double para_Pose[WINDOW_SIZE + 1][SIZE_POSE]; // 对应Ps[]、Rs[]
+    double para_SpeedBias[WINDOW_SIZE + 1][SIZE_SPEEDBIAS]; // 对应Vs[]、Bas[]、Bgs[]
+    double para_Feature[NUM_OF_F][SIZE_FEATURE]; // 对应路标点的逆深度
+    double para_Ex_Pose[2][SIZE_POSE]; // 对应相机-IMU外参tic[]、ric[]
     double para_Retrive_Pose[SIZE_POSE];
-    double para_Td[1][1];
+    double para_Td[1][1];   // 对应相机-IMU的时钟偏差td
     double para_Tr[1][1];
 
     int loop_window_index;
 
-    MarginalizationInfo *last_marginalization_info;
-    vector<double *> last_marginalization_parameter_blocks;
+    MarginalizationInfo *last_marginalization_info; // 上一轮边缘化之后保留下来的先验信息
+    vector<double *> last_marginalization_parameter_blocks; // 上一轮边缘化之后保留下来的优化变量块所在的地址。这些优化变量块和先验信息是对应的
 
     map<double, ImageFrame> all_image_frame; // 存储所有图像帧数据ImageFrame的关联容器，key为时间戳
     IntegrationBase *tmp_pre_integration; // 一个临时的积分器，用于前端快速发布 odometry，不参与后端优化

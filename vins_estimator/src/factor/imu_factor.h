@@ -17,7 +17,8 @@
 #include "integration_base.h"
 
 #include <ceres/ceres.h>
-
+// IMU残差有15维（包括dp、dq、dv、dba、dbg这5项，每项各3维。注意，虽然四元数是4维的，但local-demension是3维的）
+// 优化变量块是相邻两帧bi、b(i+1)的[p、q]、[v、ba、bg]，方块内的变量块的维度分别是7、9维，在计算雅克比的时候这两块是分开计算的
 class IMUFactor : public ceres::SizedCostFunction<15, 7, 9, 7, 9>
 {
   public:
@@ -25,13 +26,16 @@ class IMUFactor : public ceres::SizedCostFunction<15, 7, 9, 7, 9>
     IMUFactor(IntegrationBase* _pre_integration):pre_integration(_pre_integration)
     {
     }
+    // parameters[0~3]分别对应了优化变量块：para_Pose[i], para_SpeedBias[i], para_Pose[i+1], para_SpeedBias[i+1]
+    // 该函数返回计算出的残差residuals，以及雅克比矩阵jacobians
+    // 在迭代优化时，每一次迭代都会对状态量进行调整，每调整一次，都需要在这个函数里完成残差以及雅克比的计算
     virtual bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const
     {
 
         Eigen::Vector3d Pi(parameters[0][0], parameters[0][1], parameters[0][2]);
-        Eigen::Quaterniond Qi(parameters[0][6], parameters[0][3], parameters[0][4], parameters[0][5]);
+        Eigen::Quaterniond Qi(parameters[0][6], parameters[0][3], parameters[0][4], parameters[0][5]); // i图像帧对应的IMU坐标系到惯性世界坐标系的变换T^w_bi
 
-        Eigen::Vector3d Vi(parameters[1][0], parameters[1][1], parameters[1][2]);
+        Eigen::Vector3d Vi(parameters[1][0], parameters[1][1], parameters[1][2]); // i图像帧对应的IMU在世界坐标系下的速度
         Eigen::Vector3d Bai(parameters[1][3], parameters[1][4], parameters[1][5]);
         Eigen::Vector3d Bgi(parameters[1][6], parameters[1][7], parameters[1][8]);
 
@@ -68,14 +72,23 @@ class IMUFactor : public ceres::SizedCostFunction<15, 7, 9, 7, 9>
 
         Eigen::Map<Eigen::Matrix<double, 15, 1>> residual(residuals);
         residual = pre_integration->evaluate(Pi, Qi, Vi, Bai, Bgi,
-                                            Pj, Qj, Vj, Baj, Bgj);
-
+                                            Pj, Qj, Vj, Baj, Bgj); // 构建IMU残差，15x1维
+        // LLT分解，residual还需乘以信息矩阵的sqrt_info。残差都是用马氏距离来表示的，这个在ceres的优化残差中要特别注意
+        // 因为增量方程其实是：J^T * P^-1 * J * x = J^T * P^-1 * r；
+        // P表示协方差矩阵，而ceres只接受最小二乘优化min||e||^2，即：min||e^T * e||的形式。
+        // 因此需要把P^-1做LLT分解，使得增量方程为：J^T * L * L^T * J * x = J^T * L * L^T * r；
+        // 即得：(L^T * J)^T * (L^T * J) * x = (L^T * J)^T * (L^T * r)
+        // 这样就得到了等价的二乘的形式：Je^T * Je = Je * Re
+        
+        // 对预积分协方差矩阵的逆P^-1进行LLT分解，matrixL()表示获取L
         Eigen::Matrix<double, 15, 15> sqrt_info = Eigen::LLT<Eigen::Matrix<double, 15, 15>>(pre_integration->covariance.inverse()).matrixL().transpose();
         //sqrt_info.setIdentity();
         residual = sqrt_info * residual;
-
+        // 计算IMU测量残差关于待优化变量的雅克比矩阵。
+        // 优化变量块是相邻两帧的[p^w_bi、q^w_bi]、[V^w_bi、bai、bgi]，[p^w_b(i+1)、q^w_b(i+1)]、[V^w_b(i+1)、ba(i+1)、bg(i+1)]
         if (jacobians)
         {
+            // 获取预积分PVQ增量误差递推函数中pvq关于ba、bg的Jacobian
             double sum_dt = pre_integration->sum_dt;
             Eigen::Matrix3d dp_dba = pre_integration->jacobian.template block<3, 3>(O_P, O_BA);
             Eigen::Matrix3d dp_dbg = pre_integration->jacobian.template block<3, 3>(O_P, O_BG);
@@ -91,7 +104,7 @@ class IMUFactor : public ceres::SizedCostFunction<15, 7, 9, 7, 9>
                 //std::cout << pre_integration->jacobian << std::endl;
 ///                ROS_BREAK();
             }
-
+            // IMU测量残差关于i帧的IMU位姿(p^w_bi、q^w_bi)的Jacobian：15*7
             if (jacobians[0])
             {
                 Eigen::Map<Eigen::Matrix<double, 15, 7, Eigen::RowMajor>> jacobian_pose_i(jacobians[0]);
@@ -109,7 +122,7 @@ class IMUFactor : public ceres::SizedCostFunction<15, 7, 9, 7, 9>
 
                 jacobian_pose_i.block<3, 3>(O_V, O_R) = Utility::skewSymmetric(Qi.inverse() * (G * sum_dt + Vj - Vi));
 
-                jacobian_pose_i = sqrt_info * jacobian_pose_i;
+                jacobian_pose_i = sqrt_info * jacobian_pose_i; // 在构造对应的H矩阵块的时候，需要乘上信息矩阵
 
                 if (jacobian_pose_i.maxCoeff() > 1e8 || jacobian_pose_i.minCoeff() < -1e8)
                 {
@@ -118,6 +131,7 @@ class IMUFactor : public ceres::SizedCostFunction<15, 7, 9, 7, 9>
                     //ROS_BREAK();
                 }
             }
+            // IMU测量残差关于i帧的IMU的速度、bias(V^w_bi、bai、bgi)的Jacobian：15*9
             if (jacobians[1])
             {
                 Eigen::Map<Eigen::Matrix<double, 15, 9, Eigen::RowMajor>> jacobian_speedbias_i(jacobians[1]);
@@ -147,6 +161,7 @@ class IMUFactor : public ceres::SizedCostFunction<15, 7, 9, 7, 9>
                 //ROS_ASSERT(fabs(jacobian_speedbias_i.maxCoeff()) < 1e8);
                 //ROS_ASSERT(fabs(jacobian_speedbias_i.minCoeff()) < 1e8);
             }
+            // IMU测量残差关于j帧的IMU位姿(p^w_bj、q^w_bj)的Jacobian：15*7
             if (jacobians[2])
             {
                 Eigen::Map<Eigen::Matrix<double, 15, 7, Eigen::RowMajor>> jacobian_pose_j(jacobians[2]);
@@ -166,6 +181,7 @@ class IMUFactor : public ceres::SizedCostFunction<15, 7, 9, 7, 9>
                 //ROS_ASSERT(fabs(jacobian_pose_j.maxCoeff()) < 1e8);
                 //ROS_ASSERT(fabs(jacobian_pose_j.minCoeff()) < 1e8);
             }
+            // IMU测量残差关于j帧的IMU的速度、bias(V^w_bj、baj、bgj)的Jacobian：15*9
             if (jacobians[3])
             {
                 Eigen::Map<Eigen::Matrix<double, 15, 9, Eigen::RowMajor>> jacobian_speedbias_j(jacobians[3]);
@@ -192,7 +208,7 @@ class IMUFactor : public ceres::SizedCostFunction<15, 7, 9, 7, 9>
     //void checkCorrection();
     //void checkTransition();
     //void checkJacobian(double **parameters);
-    IntegrationBase* pre_integration;
+    IntegrationBase* pre_integration; // 相邻两帧bi、b(i+1)之间的IMU预积分PVQ增量
 
 };
 
