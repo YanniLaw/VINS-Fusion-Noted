@@ -31,8 +31,8 @@ class ImageFrame
         };
         map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>> > > points; // 该帧跟踪到的图像特征点数据结构，(feature_id, [camera_id, [x,y,z,u,v,vx,vy]])
         double t;
-        Matrix3d R;
-        Vector3d T;
+        Matrix3d R; // 该帧对应的imu坐标系相对于世界坐标系的旋转矩阵R_w_b(初始化时是相对于参考帧l的旋转矩阵R_cl_b)
+        Vector3d T; // 该帧对应的imu坐标系相对于世界坐标系的平移向量t_w_b
         IntegrationBase *pre_integration; // 该帧与上一帧图像帧之间的IMU预积分结果
         bool is_key_frame; // 该帧是否是关键帧
 };

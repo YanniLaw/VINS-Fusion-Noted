@@ -67,7 +67,7 @@ class FeaturePerId
     int start_frame;      // 观测到该路标点的起始帧（主导帧）在滑动窗口中的id
     vector<FeaturePerFrame> feature_per_frame; //一个路标点会被多个连续的图像帧观测到，因此这里采用vector来记录该路标点的在每个帧下的观测信息
     int used_num; // 该路标点被多少帧观测到过(被多少帧跟踪到过)，也就是feature_per_frame的size
-    double estimated_depth; // 该路标点在start_frame帧下的深度
+    double estimated_depth; // 该路标点在start_frame帧下的深度(真实深度)
     int solve_flag; // 0 haven't solve yet; 1 solve succ; 2 solve fail;
 
     FeaturePerId(int _feature_id, int _start_frame)

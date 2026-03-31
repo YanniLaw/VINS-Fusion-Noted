@@ -232,7 +232,7 @@ VectorXd FeatureManager::getDepthVector()
     return dep_vec;
 }
 
-
+// 参考 GlobalSFM::triangulatePoint，输入两帧的投影矩阵和两帧的特征点观测，输出三维点坐标
 void FeatureManager::triangulatePoint(Eigen::Matrix<double, 3, 4> &Pose0, Eigen::Matrix<double, 3, 4> &Pose1,
                         Eigen::Vector2d &point0, Eigen::Vector2d &point1, Eigen::Vector3d &point_3d)
 {
@@ -362,8 +362,8 @@ void FeatureManager::initFramePoseByPnP(int frameCnt, Vector3d Ps[], Matrix3d Rs
  * 其实是一个灵活的深度计算策略——双目靠空间基线，单目靠时间基线，观测多时上 SVD 求最优解
  * 在VINS-Fusion 的后端里，特征是按“首观测帧的逆深度”进入滑窗状态的，所以这里不是在求最终优化结果，而是在给后续非线性优化提供一个初始depth seed
  * @param frameCnt 当前帧在滑窗中的id
- * @param Ps 
- * @param Rs 
+ * @param Ps 滑窗中每帧的平移向量（带尺度的平移） Ps[i] 是第 i 帧在世界坐标系下的平移向量，i 从 0 到 frameCnt
+ * @param Rs 滑窗中每帧的旋转矩阵 Rs[i] 是第 i 帧在世界坐标系下的旋转矩阵，i 从 0 到 frameCnt
  * @param tic 相机系到imu系的平移向量
  * @param ric 相机系到imu系的旋转矩阵
  */
@@ -373,20 +373,21 @@ void FeatureManager::triangulate(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vec
     // 在初始化恢复出尺度s之后，Ps[]是带有尺度的平移，因此这里求出的深度是真实的物理深度
     for (auto &it_per_id : feature)
     {
+        // 单目模式下，如果是刚初始化，那么此时会清空掉所有的估计深度值
         if (it_per_id.estimated_depth > 0) // 该路标点的深度值如果大于0，说明该点已被三角化过了
             continue;
         // 双目模式下，同一时刻直接三角化(因为双目同一时刻两帧图像之间的基线是固定的，三角化结果更稳定)
         if(STEREO && it_per_id.feature_per_frame[0].is_stereo)
         {
             int imu_i = it_per_id.start_frame; // 直接用首帧观测进行三角化
-            Eigen::Matrix<double, 3, 4> leftPose; // 左目
+            Eigen::Matrix<double, 3, 4> leftPose; // 左目,这里的Pose是投影矩阵，即T_c_w
             Eigen::Vector3d t0 = Ps[imu_i] + Rs[imu_i] * tic[0]; // t_w_c = t_w_i + R_w_i * t_i_c
             Eigen::Matrix3d R0 = Rs[imu_i] * ric[0];  // R_w_c = R_w_i * R_i_c
             leftPose.leftCols<3>() = R0.transpose(); // 下面是求T_c_w
             leftPose.rightCols<1>() = -R0.transpose() * t0;
             //cout << "left pose " << leftPose << endl;
 
-            Eigen::Matrix<double, 3, 4> rightPose; // 右目
+            Eigen::Matrix<double, 3, 4> rightPose; // 右目，同一时刻两帧图像之间的基线是固定的，三角化结果更稳定
             Eigen::Vector3d t1 = Ps[imu_i] + Rs[imu_i] * tic[1];
             Eigen::Matrix3d R1 = Rs[imu_i] * ric[1];
             rightPose.leftCols<3>() = R1.transpose();
@@ -399,9 +400,10 @@ void FeatureManager::triangulate(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vec
             point1 = it_per_id.feature_per_frame[0].pointRight.head(2);
             //cout << "point0 " << point0.transpose() << endl;
             //cout << "point1 " << point1.transpose() << endl;
-
+            // point3d 是三角化得到的路标点在世界坐标系下的坐标
             triangulatePoint(leftPose, rightPose, point0, point1, point3d);
             Eigen::Vector3d localPoint;
+            // P_c = T_c_w * P_w = [R_c_w | t_c_w] * P_w = R_c_w * P_w + t_c_w
             localPoint = leftPose.leftCols<3>() * point3d + leftPose.rightCols<1>(); // 把三角化得到的世界点重新变回左相机坐标系
             double depth = localPoint.z(); // depth就是该路标点在首观测帧的左目坐标系下的z值，也就是深度
             if (depth > 0)
@@ -421,11 +423,11 @@ void FeatureManager::triangulate(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vec
             // 它只用前两次观测，没用整条轨迹。所以这不是最优多视图三角化，而是一个“够快够用”的初始值生成器
             // 它默认第二个观测就是 imu_i + 1 这帧
             int imu_i = it_per_id.start_frame; // 首帧观测
-            Eigen::Matrix<double, 3, 4> leftPose;
-            Eigen::Vector3d t0 = Ps[imu_i] + Rs[imu_i] * tic[0];
-            Eigen::Matrix3d R0 = Rs[imu_i] * ric[0];
-            leftPose.leftCols<3>() = R0.transpose();
-            leftPose.rightCols<1>() = -R0.transpose() * t0;
+            Eigen::Matrix<double, 3, 4> leftPose; // 这里是投影矩阵，即T_c_w
+            Eigen::Vector3d t0 = Ps[imu_i] + Rs[imu_i] * tic[0];    // t_w_c = t_w_i + R_w_i * t_i_c
+            Eigen::Matrix3d R0 = Rs[imu_i] * ric[0];                // R_w_c = R_w_i * R_i_c
+            leftPose.leftCols<3>() = R0.transpose();                // R_c_w = R_w_c^T
+            leftPose.rightCols<1>() = -R0.transpose() * t0;         // t_c_w = -R_w_c^T * t_w_c
             // 第二帧观测，默认就是首帧观测的下一帧
             imu_i++;
             Eigen::Matrix<double, 3, 4> rightPose;
@@ -436,8 +438,9 @@ void FeatureManager::triangulate(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vec
 
             Eigen::Vector2d point0, point1;
             Eigen::Vector3d point3d;
-            point0 = it_per_id.feature_per_frame[0].point.head(2);
-            point1 = it_per_id.feature_per_frame[1].point.head(2);
+            point0 = it_per_id.feature_per_frame[0].point.head(2);  // 第一帧观测的平面归一化坐标
+            point1 = it_per_id.feature_per_frame[1].point.head(2);  // 第二帧观测的平面归一化坐标
+            // point3d 是三角化得到的路标点在世界坐标系下的坐标
             triangulatePoint(leftPose, rightPose, point0, point1, point3d);
             Eigen::Vector3d localPoint;
             localPoint = leftPose.leftCols<3>() * point3d + leftPose.rightCols<1>(); // 将三角化结果变到首帧观测的左相机坐标系

@@ -14,52 +14,76 @@
 GlobalSFM::GlobalSFM(){}
 
 // 已知两个视角的相机投影矩阵（Pose0, Pose1，其实就是T_c_w）和对应的归一化平面坐标（point0, point1），求解出该特征点在空间中的3D坐标
+// 直接使用线性三角化方法，构造设计矩阵（design_matrix）并对其进行SVD分解，得到的最小奇异值对应的右奇异向量即为该特征点的齐次坐标
+// 假设3D点为X = [X Y Z 1]^T，投影点为p = [u v 1]^T，投影矩阵为P，则有sp = P * X，(s为尺度因子)
+// 可以利用叉乘消除尺度因子s，得到p x (P * X) = 0; 也可以直接用数学消去法消去尺度因子s。
+// 即u = (P.row(0) * X) / (P.row(2) * X)，v = (P.row(1) * X) / (P.row(2) * X)，可以得到如下设计矩阵：
+// | u * P.row(2) - P.row(0) | * X = 0
+// | v * P.row(2) - P.row(1) | * X = 0
+// 一个相机的观测可以提供上面2个方程。如果是两个相机观测到同一个点，就可以提供4个方程，从而构建一个 AX = 0 的线性方程组
+// 这里A就是代码中的设计矩阵(Design Matrix)，4x4，对其进行SVD分解，得到的最小奇异值对应的右奇异向量即为该特征点的齐次坐标
+// note: 当两个视角的基线极短，或3D点接近无穷远时，该方法数值稳定性会下降，实际使用中通常需要对三角化结果做深度为正的检验
 void GlobalSFM::triangulatePoint(Eigen::Matrix<double, 3, 4> &Pose0, Eigen::Matrix<double, 3, 4> &Pose1,
 						Vector2d &point0, Vector2d &point1, Vector3d &point_3d)
 {
 	Matrix4d design_matrix = Matrix4d::Zero();
-	design_matrix.row(0) = point0[0] * Pose0.row(2) - Pose0.row(0);
+	design_matrix.row(0) = point0[0] * Pose0.row(2) - Pose0.row(0); // Pose0 的观测
 	design_matrix.row(1) = point0[1] * Pose0.row(2) - Pose0.row(1);
-	design_matrix.row(2) = point1[0] * Pose1.row(2) - Pose1.row(0);
+	design_matrix.row(2) = point1[0] * Pose1.row(2) - Pose1.row(0); // Pose1 的观测
 	design_matrix.row(3) = point1[1] * Pose1.row(2) - Pose1.row(1);
+	// 由于不可避免的测量噪声（图像上的特征点提取有误差），这四个方程在实际中是不相交的，即方程组 AX = 0没有绝对的非零精确解
+	// 因此，我们需要寻找最小二乘解。求解超定齐次线性方程组 AX = 0 的标准做法是使用奇异值分解 (SVD)：A = U ∑ V^T
+	// 在约束条件 ||X|| = 1下，使得 ||AX||最小的解X，正是矩阵V中对应最小奇异值的列向量，也就是矩阵V的最后一列
 	Vector4d triangulated_point;
 	triangulated_point =
 		      design_matrix.jacobiSvd(Eigen::ComputeFullV).matrixV().rightCols<1>();
+	// 这里的point_3d其实是输入的world系下的3D点坐标，因为输入的Pose0、Pose1是T_c_w，
+	// 即世界系相对于相机系的变换矩阵，所以得到的3D点坐标也是在世界系下的
 	point_3d(0) = triangulated_point(0) / triangulated_point(3);
 	point_3d(1) = triangulated_point(1) / triangulated_point(3);
 	point_3d(2) = triangulated_point(2) / triangulated_point(3);
 }
 
-
+/**
+ * @brief 通过 PnP（Perspective-n-Point）算法求解相机的位姿（旋转和平移）
+ * 
+ * @param R_initial 世界系相对于相机系的旋转矩阵R_cw(初始值)
+ * @param P_initial 世界系相对于相机系的平移向量T_cw
+ * @param i 待求解帧在滑窗中的索引
+ * @param sfm_f sfm过程中的特征点数据结构
+ * @return true/false 成功/失败求解出该帧的位姿
+ */
 bool GlobalSFM::solveFrameByPnP(Matrix3d &R_initial, Vector3d &P_initial, int i,
 								vector<SFMFeature> &sfm_f)
 {
-	vector<cv::Point2f> pts_2_vector;
-	vector<cv::Point3f> pts_3_vector;
-	for (int j = 0; j < feature_num; j++)
+	vector<cv::Point2f> pts_2_vector; // 该帧观测到的特征点在相机归一化平面坐标系下的坐标集合
+	vector<cv::Point3f> pts_3_vector; // 该帧观测到的特征点在空间中的3D坐标集合（注意，这些3D坐标是以第l帧相机坐标系为参考系的）
+	for (int j = 0; j < feature_num; j++) // 遍历当前滑窗中的所有特征点
 	{
-		if (sfm_f[j].state != true)
+		if (sfm_f[j].state != true) // 如果该特征点没有被成功三角化出3D坐标，就没法执行PnP了，跳过
 			continue;
 		Vector2d point2d;
-		for (int k = 0; k < (int)sfm_f[j].observation.size(); k++)
+		for (int k = 0; k < (int)sfm_f[j].observation.size(); k++) // 遍历该特征点的所有观测帧
 		{
-			if (sfm_f[j].observation[k].first == i)
+			if (sfm_f[j].observation[k].first == i) // 如果该特征点在带求解帧中被观测到
 			{
 				Vector2d img_pts = sfm_f[j].observation[k].second;
-				cv::Point2f pts_2(img_pts(0), img_pts(1));
+				cv::Point2f pts_2(img_pts(0), img_pts(1)); // 该特征点在该帧相机归一化平面坐标系下的坐标
 				pts_2_vector.push_back(pts_2);
-				cv::Point3f pts_3(sfm_f[j].position[0], sfm_f[j].position[1], sfm_f[j].position[2]);
+				cv::Point3f pts_3(sfm_f[j].position[0], sfm_f[j].position[1], sfm_f[j].position[2]); // 该特征点在空间中的3D坐标（以第l帧相机坐标系为参考系）
 				pts_3_vector.push_back(pts_3);
 				break;
 			}
 		}
 	}
+	// 虽然理论上PnP最少只需要3个点对（P3P）就可以求解出有限个解，但在实际工程中，由于不可避免的测量噪声，点太少会导致解极不稳定 
 	if (int(pts_2_vector.size()) < 15)
 	{
 		printf("unstable features tracking, please slowly move you device!\n");
 		if (int(pts_2_vector.size()) < 10)
 			return false;
 	}
+	// 数据类型转换
 	cv::Mat r, rvec, t, D, tmp_r;
 	cv::eigen2cv(R_initial, tmp_r);
 	cv::Rodrigues(tmp_r, rvec);
@@ -159,7 +183,7 @@ bool GlobalSFM::construct(int frame_num, Quaterniond* q, Vector3d* T, int l,
 			  const Matrix3d relative_R, const Vector3d relative_T,
 			  vector<SFMFeature> &sfm_f, map<int, Vector3d> &sfm_tracked_points)
 {
-	feature_num = sfm_f.size(); // 当前滑窗中特征点的数量
+	feature_num = sfm_f.size(); // 当前滑窗中所有特征点的数量
 	//cout << "set 0 and " << l << " as known " << endl;
 	// have relative_r relative_t
 	// intial two view
@@ -205,7 +229,7 @@ bool GlobalSFM::construct(int frame_num, Quaterniond* q, Vector3d* T, int l,
 		// 所以在初始化时，相机移动不能过快，否则可能没有重叠区域，就会没有被共同观测到的路标点，这样也不能完成solveFrameByPnP，从而求不出l+1帧位姿
 		if (i > l)
 		{
-			Matrix3d R_initial = c_Rotation[i - 1]; // 使用上一帧 (i-1) 的位姿作为初始猜测(连续性假设)
+			Matrix3d R_initial = c_Rotation[i - 1]; // 使用上一帧 (i-1) 的位姿作为初始猜测(连续性假设),R_cw
 			Vector3d P_initial = c_Translation[i - 1];
 			// 利用已经三角化出来的3D点和当前帧对应的2D观测，求解该帧的Pose
 			if(!solveFrameByPnP(R_initial, P_initial, i, sfm_f))
@@ -240,7 +264,7 @@ bool GlobalSFM::construct(int frame_num, Quaterniond* q, Vector3d* T, int l,
 		c_Rotation[i] = R_initial;
 		c_Translation[i] = P_initial;
 		c_Quat[i] = c_Rotation[i];
-		Pose[i].block<3, 3>(0, 0) = c_Rotation[i];
+		Pose[i].block<3, 3>(0, 0) = c_Rotation[i]; // R_cw
 		Pose[i].block<3, 1>(0, 3) = c_Translation[i];
 		//triangulate
 		triangulateTwoFrames(i, Pose[i], l, Pose[l], sfm_f);
@@ -360,7 +384,7 @@ bool GlobalSFM::construct(int frame_num, Quaterniond* q, Vector3d* T, int l,
 	}
 	for (int i = 0; i < frame_num; i++)
 	{
-		// t_wc = -R_wc * t_cw
+		// t_wc = - R_c_w^T * t_c_w = -R_wc * t_cw
 		T[i] = -1 * (q[i] * Vector3d(c_translation[i][0], c_translation[i][1], c_translation[i][2]));
 		//cout << "final  t" << " i " << i <<"  " << T[i](0) <<"  "<< T[i](1) <<"  "<< T[i](2) << endl;
 	}

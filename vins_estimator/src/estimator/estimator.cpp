@@ -802,7 +802,7 @@ bool Estimator::initialStructure()
         // 情况 A：当前帧是 SfM 算过的“关键帧”
         if((frame_it->first) == Headers[i]) // 该帧在滑动窗口中，直接使用前面SFM结果
         {
-            // SfM 算的是相机在世界下的位姿，而VINS需要的是 IMU 在世界下的位姿
+            // SfM 算的是相机在世界(参考帧l)下的位姿，而VINS需要的是 IMU 在世界下的位姿
             frame_it->second.is_key_frame = true; // RIC[0] 左目 R_imu_cam
             frame_it->second.R = Q[i].toRotationMatrix() * RIC[0].transpose(); // R^cl_ci * (R_imu_cam)^T 在前面的sfm中求解的是相对于参考帧cl的旋转，这里要转换到IMU body系下
             frame_it->second.T = T[i]; // 此时尺度s还未估计出来，因此还不能对平移做变换
@@ -819,8 +819,9 @@ bool Estimator::initialStructure()
         {
             i++;
         }
+        // 格式转换：Eigen的旋转矩阵和平移向量转换成OpenCV的格式，后面要用OpenCV的solvePnP函数来求解位姿
         Matrix3d R_inital = (Q[i].inverse()).toRotationMatrix(); // 这里的R_inital是到世界系(滑窗中第l帧坐标系)到滑窗中第i帧图像系的变换 R_C_W
-        Vector3d P_inital = - R_inital * T[i]; // t_cw = -R_cw * t_wc
+        Vector3d P_inital = - R_inital * T[i]; // t_cw = -R_w_c^T * t_w_c = -R_cw * t_wc
         cv::eigen2cv(R_inital, tmp_r);
         cv::Rodrigues(tmp_r, rvec); //罗德里格斯公式将旋转矩阵转换成旋转向量
         cv::eigen2cv(P_inital, t);
@@ -884,13 +885,13 @@ bool Estimator::initialStructure()
         }
         cv::Rodrigues(rvec, r);
         MatrixXd R_pnp,tmp_R_pnp;
-        cv::cv2eigen(r, tmp_R_pnp);
-        R_pnp = tmp_R_pnp.transpose(); // R_w_c
+        cv::cv2eigen(r, tmp_R_pnp); // 这里还是得到的相机坐标系到世界坐标系的旋转R_c_w
+        R_pnp = tmp_R_pnp.transpose(); // R_w_c = R_c_w^T
         MatrixXd T_pnp;
         cv::cv2eigen(t, T_pnp);
-        T_pnp = R_pnp * (-T_pnp);   // t_w_c = -R_w_c * t_c_w
+        T_pnp = R_pnp * (-T_pnp);   // t_w_c = -R_c_w^T * t_c_w = -R_w_c * t_c_w
         frame_it->second.R = R_pnp * RIC[0].transpose(); // 转换到IMU body系下 R_w_i = R_w_c * R_c_i
-        frame_it->second.T = T_pnp;
+        frame_it->second.T = T_pnp; // 此时尺度s还未估计出来
     }
     // 进行视觉-惯性联合初始化
     // 因为视觉SFM在初始化的过程中有着较好的表现，所以在初始化的过程中主要以SFM为主，然后将IMU的预积分结果与其对齐，即可得到较好的初始化结果
@@ -930,13 +931,13 @@ bool Estimator::visualInitialAlign()
     {
         Matrix3d Ri = all_image_frame[Headers[i]].R; // 该图像帧时对应的IMU坐标系到相机帧l坐标系的旋转变换
         Vector3d Pi = all_image_frame[Headers[i]].T; // 该图像帧到相机帧l坐标系的平移变换，即第l帧相机坐标系原点->i帧相机坐标系原点的平移向量，以第l帧坐标系为参考坐标系
-        Ps[i] = Pi;
+        Ps[i] = Pi; // up-to-scale的平移向量，来自之前的SFM结果
         Rs[i] = Ri;
         all_image_frame[Headers[i]].is_key_frame = true;
     }
 
-    double s = (x.tail<1>())(0); // 尺度
-    // 重新传播滑窗中的预积分，前面更新的是all_image_frame每一帧的预积分
+    double s = (x.tail<1>())(0); // 获取解算出来的尺度
+    // 重新传播滑窗中的预积分，前面VisualIMUAlignment更新的是all_image_frame每一帧的预积分
     for (int i = 0; i <= WINDOW_SIZE; i++) // 更新了陀螺仪的偏置Bgs之后，需要重新计算IMU预积分
     {
         // acc_bias 线加速度计偏置在初始化过程中不考虑，所以传入零向量；gyro_bias 传入上面求解出来的陀螺仪偏置
@@ -955,17 +956,20 @@ bool Estimator::visualInitialAlign()
     {
         if(frame_i->second.is_key_frame)
         {
-            kv++;
-            Vs[kv] = frame_i->second.R * x.segment<3>(kv * 3); // 将速度转换到
+            kv++; // 状态x中的速度是基于imu自身坐标系下的，即 V^bn_bn
+            Vs[kv] = frame_i->second.R * x.segment<3>(kv * 3); // 将速度转换到参考帧l的坐标系下，Vs[i] = R_cl_i * V^bn_bn
         }
     }
-    // 重力对齐，旋转变换 R0 是从之前的 SfM 坐标系到重力对齐坐标系的旋转矩阵(对齐z轴，yaw已经清零了)
-    Matrix3d R0 = Utility::g2R(g);
-    double yaw = Utility::R2ypr(R0 * Rs[0]).x(); // 将滑窗第一帧对齐重力坐标系， Rs[0]在initFirstIMUPose中初始化的
-    R0 = Utility::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0; // yaw清零
-    g = R0 * g; // yaw清零下的重力向量
+    // 重力对齐，此时旋转变换 R0 其实就是是从cl坐标系到重力对齐坐标系(真正的世界坐标系)的旋转矩阵(对齐z轴，yaw已经清零了)  R_w_cl
+    Matrix3d R0 = Utility::g2R(g); // g是初始化优化出来的重力向量(基于cl坐标系)
+    // R0 * Rs[0] 其实就是 R_w_c0 = R_w_cl * R_cl_c0
+    double yaw = Utility::R2ypr(R0 * Rs[0]).x(); // 计算滑窗第一帧在世界坐标系中的yaw角，后面再把它清零
+    // 把滑窗中第一帧的yaw清零，得到新的 R_w_cl
+    R0 = Utility::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0; // 左乘，绕世界坐标系旋转清零
+    g = R0 * g; // 滑窗第一帧yaw清零后更新重力向量
     //Matrix3d rot_diff = R0 * Rs[0].transpose();
-    // 将滑动窗口中每一帧的状态变量都乘以旋转矩阵R0，使得整个滑动窗口中的帧都对齐到重力坐标系下
+    // 将滑动窗口中每一帧的状态变量都乘以旋转矩阵R0，使得整个滑动窗口中的帧都对齐到重力坐标系(世界坐标系)下
+    // 现在的Ps[i]、Rs[i]、Vs[i]都是在重力对齐的世界坐标系下了
     Matrix3d rot_diff = R0;
     for (int i = 0; i <= frame_count; i++)
     {

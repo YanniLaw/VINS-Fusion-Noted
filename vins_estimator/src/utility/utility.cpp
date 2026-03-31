@@ -9,7 +9,7 @@
 
 #include "utility.h"
 
-// 用一段时间内的加速度均值（近似“重力方向”）来估计初始姿态的 roll/pitch，并把 yaw（航向）固定为 0
+// 用输入的重力向量来估计姿态的 roll/pitch，并把 yaw（航向）固定为 0
 Eigen::Matrix3d Utility::g2R(const Eigen::Vector3d &g)
 {
     Eigen::Matrix3d R0;
@@ -17,7 +17,7 @@ Eigen::Matrix3d Utility::g2R(const Eigen::Vector3d &g)
     Eigen::Vector3d ng2{0, 0, 1.0}; // 世界坐标系g的重力方向
     R0 = Eigen::Quaterniond::FromTwoVectors(ng1, ng2).toRotationMatrix(); // R_world_g
     double yaw = Utility::R2ypr(R0).x();
-    R0 = Utility::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0;
+    R0 = Utility::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0; // 左乘一个绕z轴的旋转矩阵，把yaw清零，得到新的 R_world_g
     // R0 = Utility::ypr2R(Eigen::Vector3d{-90, 0, 0}) * R0;
     return R0;
 }
