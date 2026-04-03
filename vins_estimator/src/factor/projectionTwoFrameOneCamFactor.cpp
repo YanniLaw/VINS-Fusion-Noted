@@ -14,6 +14,16 @@
 Eigen::Matrix2d ProjectionTwoFrameOneCamFactor::sqrt_info; // 重投影误差的平方根信息矩阵
 double ProjectionTwoFrameOneCamFactor::sum_t;
 
+/**
+ * @brief 这个类就是计算两帧单目相机重投影误差因子
+ * 
+ * @param _pts_i 该路标点在start_frame帧下的归一化相机坐标
+ * @param _pts_j 该路标点在当前帧下的归一化相机坐标
+ * @param _velocity_i 该路标点在start_frame帧相机归一化平面上的速度
+ * @param _velocity_j 该路标点在当前帧相机归一化平面上的速度
+ * @param _td_i start_frame帧的imu-camera的同步时钟偏差
+ * @param _td_j 当前帧的imu-camera的同步时钟偏差
+ */
 ProjectionTwoFrameOneCamFactor::ProjectionTwoFrameOneCamFactor(const Eigen::Vector3d &_pts_i, const Eigen::Vector3d &_pts_j, 
                                        const Eigen::Vector2d &_velocity_i, const Eigen::Vector2d &_velocity_j,
                                        const double _td_i, const double _td_j) : 
@@ -40,21 +50,24 @@ ProjectionTwoFrameOneCamFactor::ProjectionTwoFrameOneCamFactor(const Eigen::Vect
 #endif
 };
 
+// parameters[0~4]分别对应了优化变量块：para_Pose[i], para_Pose[j], para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]
+// 该函数返回计算出的残差residuals，以及雅克比矩阵jacobians
 bool ProjectionTwoFrameOneCamFactor::Evaluate(double const *const *parameters, double *residuals, double **jacobians) const
 {
     TicToc tic_toc;
+    // i图像帧对应的IMU坐标系到世界坐标系的变换T^w_bi
     Eigen::Vector3d Pi(parameters[0][0], parameters[0][1], parameters[0][2]);
     Eigen::Quaterniond Qi(parameters[0][6], parameters[0][3], parameters[0][4], parameters[0][5]);
-
+    // j图像帧对应的IMU坐标系到世界坐标系的变换T^w_bj
     Eigen::Vector3d Pj(parameters[1][0], parameters[1][1], parameters[1][2]);
     Eigen::Quaterniond Qj(parameters[1][6], parameters[1][3], parameters[1][4], parameters[1][5]);
-
+    // 相机到IMU的外参
     Eigen::Vector3d tic(parameters[2][0], parameters[2][1], parameters[2][2]);
     Eigen::Quaterniond qic(parameters[2][6], parameters[2][3], parameters[2][4], parameters[2][5]);
 
-    double inv_dep_i = parameters[3][0];
+    double inv_dep_i = parameters[3][0];  // 路标点的逆深度
 
-    double td = parameters[4][0];
+    double td = parameters[4][0];   // 相机-IMU的时钟偏差
 
     Eigen::Vector3d pts_i_td, pts_j_td;
     pts_i_td = pts_i - (td - td_i) * velocity_i;

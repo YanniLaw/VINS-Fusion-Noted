@@ -52,6 +52,7 @@ int FeatureManager::getFeatureCount()
 
 /**
  * @brief   选择关键帧的策略。只有关键帧才会被加入到滑窗内
+ * 先保证跟踪别断，再用视差判断倒数第二帧是不是冗余帧，如果冗余就边缘化次新帧，否则边缘化最老帧
  * @param[in]   frame_count：当前帧在滑动窗口中的id，从0开始
  * @param[in]   image：当前帧图像特征点的信息(feature_id, [camera_id, [x,y,z,u,v,vx,vy]])所构成的map，索引为feature_id
  * @param[in]   td：IMU和cam同步时间差

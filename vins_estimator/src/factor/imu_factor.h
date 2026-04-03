@@ -31,11 +31,11 @@ class IMUFactor : public ceres::SizedCostFunction<15, 7, 9, 7, 9>
     // 在迭代优化时，每一次迭代都会对状态量进行调整，每调整一次，都需要在这个函数里完成残差以及雅克比的计算
     virtual bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const
     {
-
+        // i图像帧对应的IMU坐标系到惯性世界坐标系的变换T^w_bi
         Eigen::Vector3d Pi(parameters[0][0], parameters[0][1], parameters[0][2]);
-        Eigen::Quaterniond Qi(parameters[0][6], parameters[0][3], parameters[0][4], parameters[0][5]); // i图像帧对应的IMU坐标系到惯性世界坐标系的变换T^w_bi
-
-        Eigen::Vector3d Vi(parameters[1][0], parameters[1][1], parameters[1][2]); // i图像帧对应的IMU在世界坐标系下的速度
+        Eigen::Quaterniond Qi(parameters[0][6], parameters[0][3], parameters[0][4], parameters[0][5]);
+        // i图像帧对应的IMU在世界坐标系下的速度V^w_bi，以及零偏ba_i、bg_i
+        Eigen::Vector3d Vi(parameters[1][0], parameters[1][1], parameters[1][2]);
         Eigen::Vector3d Bai(parameters[1][3], parameters[1][4], parameters[1][5]);
         Eigen::Vector3d Bgi(parameters[1][6], parameters[1][7], parameters[1][8]);
 
@@ -74,9 +74,11 @@ class IMUFactor : public ceres::SizedCostFunction<15, 7, 9, 7, 9>
         residual = pre_integration->evaluate(Pi, Qi, Vi, Bai, Bgi,
                                             Pj, Qj, Vj, Baj, Bgj); // 构建IMU残差，15x1维
         // LLT分解，residual还需乘以信息矩阵的sqrt_info。残差都是用马氏距离来表示的，这个在ceres的优化残差中要特别注意
-        // 因为增量方程其实是：J^T * P^-1 * J * x = J^T * P^-1 * r；
-        // P表示协方差矩阵，而ceres只接受最小二乘优化min||e||^2，即：min||e^T * e||的形式。
-        // 因此需要把P^-1做LLT分解，使得增量方程为：J^T * L * L^T * J * x = J^T * L * L^T * r；
+        // 因为增量方程其实是：J^T * P^-1 * J * x = J^T * P^-1 * r； P表示协方差矩阵，
+        // 而ceres只能处理最小二乘优化问题 min||e||^2，即：min||e^T * e||的形式。
+        // 因为P^-1是一个对称正定矩阵，我们可以通过cholesky分解将其分解为(LLT分解)
+        // P^-1 = L^T * L，然后令e = L*r
+        // 使得增量方程为：J^T * L * L^T * J * x = J^T * L * L^T * r；
         // 即得：(L^T * J)^T * (L^T * J) * x = (L^T * J)^T * (L^T * r)
         // 这样就得到了等价的二乘的形式：Je^T * Je = Je * Re
         

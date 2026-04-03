@@ -121,6 +121,7 @@ void printStatistics(const Estimator &estimator, double t)
         ROS_INFO("td %f", estimator.td);
 }
 
+// 发布滑窗最新帧的位姿以及路径
 void pubOdometry(const Estimator &estimator, const std_msgs::Header &header)
 {
     if (estimator.solver_flag == Estimator::SolverFlag::NON_LINEAR)
@@ -141,7 +142,7 @@ void pubOdometry(const Estimator &estimator, const std_msgs::Header &header)
         odometry.twist.twist.linear.x = estimator.Vs[WINDOW_SIZE].x();
         odometry.twist.twist.linear.y = estimator.Vs[WINDOW_SIZE].y();
         odometry.twist.twist.linear.z = estimator.Vs[WINDOW_SIZE].z();
-        pub_odometry.publish(odometry);
+        pub_odometry.publish(odometry); // 滑窗最新帧位姿
 
         geometry_msgs::PoseStamped pose_stamped;
         pose_stamped.header = header;
@@ -175,6 +176,7 @@ void pubOdometry(const Estimator &estimator, const std_msgs::Header &header)
     }
 }
 
+// 发布滑窗中所有帧的位置(世界坐标系下)
 void pubKeyPoses(const Estimator &estimator, const std_msgs::Header &header)
 {
     if (estimator.key_poses.size() == 0)
@@ -209,9 +211,10 @@ void pubKeyPoses(const Estimator &estimator, const std_msgs::Header &header)
     pub_key_poses.publish(key_poses);
 }
 
+// 发布滑窗中次新帧的位姿(世界坐标系下)
 void pubCameraPose(const Estimator &estimator, const std_msgs::Header &header)
 {
-    int idx2 = WINDOW_SIZE - 1;
+    int idx2 = WINDOW_SIZE - 1; // 次新帧
 
     if (estimator.solver_flag == Estimator::SolverFlag::NON_LINEAR)
     {
@@ -244,7 +247,7 @@ void pubCameraPose(const Estimator &estimator, const std_msgs::Header &header)
     }
 }
 
-
+// 把当前滑窗里已经三角化成功的特征点转成世界坐标，发布成 ROS 点云；同时再挑出一批“即将被边缘化”的老点，单独发布
 void pubPointCloud(const Estimator &estimator, const std_msgs::Header &header)
 {
     sensor_msgs::PointCloud point_cloud, loop_point_cloud;
@@ -256,13 +259,16 @@ void pubPointCloud(const Estimator &estimator, const std_msgs::Header &header)
     {
         int used_num;
         used_num = it_per_id.feature_per_frame.size();
+        // 需要满足以下两个条件:
+        // 1. 至少被看见两次，而且不是太新的点
         if (!(used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2))
             continue;
+        // 2. 只要更老、更稳定、且已经解出来的点
         if (it_per_id.start_frame > WINDOW_SIZE * 3.0 / 4.0 || it_per_id.solve_flag != 1)
             continue;
         int imu_i = it_per_id.start_frame;
-        Vector3d pts_i = it_per_id.feature_per_frame[0].point * it_per_id.estimated_depth;
-        Vector3d w_pts_i = estimator.Rs[imu_i] * (estimator.ric[0] * pts_i + estimator.tic[0]) + estimator.Ps[imu_i];
+        Vector3d pts_i = it_per_id.feature_per_frame[0].point * it_per_id.estimated_depth; // 首帧相机坐标系下的坐标
+        Vector3d w_pts_i = estimator.Rs[imu_i] * (estimator.ric[0] * pts_i + estimator.tic[0]) + estimator.Ps[imu_i]; // 世界坐标系下的坐标
 
         geometry_msgs::Point32 p;
         p.x = w_pts_i(0);
@@ -281,11 +287,11 @@ void pubPointCloud(const Estimator &estimator, const std_msgs::Header &header)
     { 
         int used_num;
         used_num = it_per_id.feature_per_frame.size();
-        if (!(used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2))
+        if (!(used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2)) // 至少被看见两次，而且不是太新的点
             continue;
         //if (it_per_id->start_frame > WINDOW_SIZE * 3.0 / 4.0 || it_per_id->solve_flag != 1)
         //        continue;
-
+        // 那些依附于最老帧、很快会随着滑窗边缘化而消失的特征点
         if (it_per_id.start_frame == 0 && it_per_id.feature_per_frame.size() <= 2 
             && it_per_id.solve_flag == 1 )
         {
@@ -314,7 +320,7 @@ void pubTF(const Estimator &estimator, const std_msgs::Header &header)
     // body frame
     Vector3d correct_t;
     Quaterniond correct_q;
-    correct_t = estimator.Ps[WINDOW_SIZE];
+    correct_t = estimator.Ps[WINDOW_SIZE]; // 取滑窗最新帧的位姿作为当前位姿发布到 TF 上
     correct_q = estimator.Rs[WINDOW_SIZE];
 
     transform.setOrigin(tf::Vector3(correct_t(0),
@@ -338,7 +344,7 @@ void pubTF(const Estimator &estimator, const std_msgs::Header &header)
     transform.setRotation(q);
     br.sendTransform(tf::StampedTransform(transform, header.stamp, "body", "camera"));
 
-    
+    // 发布外参
     nav_msgs::Odometry odometry;
     odometry.header = header;
     odometry.header.frame_id = "world";
@@ -357,9 +363,10 @@ void pubTF(const Estimator &estimator, const std_msgs::Header &header)
 void pubKeyframe(const Estimator &estimator)
 {
     // pub camera pose, 2D-3D points of keyframe
+    // 如果边缘化了滑动窗口中的最老帧，则发布滑动窗口中次新帧的位姿(世界坐标系下)以及次新帧对应的特征点位置(世界坐标系下)和特征点观测值(像素坐标系下)
     if (estimator.solver_flag == Estimator::SolverFlag::NON_LINEAR && estimator.marginalization_flag == 0)
     {
-        int i = WINDOW_SIZE - 2;
+        int i = WINDOW_SIZE - 2; // 次次新帧
         //Vector3d P = estimator.Ps[i] + estimator.Rs[i] * estimator.tic[0];
         Vector3d P = estimator.Ps[i];
         Quaterniond R = Quaterniond(estimator.Rs[i]);
@@ -385,11 +392,14 @@ void pubKeyframe(const Estimator &estimator)
         for (auto &it_per_id : estimator.f_manager.feature)
         {
             int frame_size = it_per_id.feature_per_frame.size();
+            // 次次新帧观测到的特征点
             if(it_per_id.start_frame < WINDOW_SIZE - 2 && it_per_id.start_frame + frame_size - 1 >= WINDOW_SIZE - 2 && it_per_id.solve_flag == 1)
             {
 
                 int imu_i = it_per_id.start_frame;
+                // 特征点在首帧观测下的坐标(相机坐标系下)
                 Vector3d pts_i = it_per_id.feature_per_frame[0].point * it_per_id.estimated_depth;
+                // 特征点(路标点)在世界坐标系下的坐标
                 Vector3d w_pts_i = estimator.Rs[imu_i] * (estimator.ric[0] * pts_i + estimator.tic[0])
                                       + estimator.Ps[imu_i];
                 geometry_msgs::Point32 p;

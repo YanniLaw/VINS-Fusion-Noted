@@ -367,12 +367,12 @@ void Estimator::processMeasurements()
             header.frame_id = "world";
             header.stamp = ros::Time(feature.first);
 
-            pubOdometry(*this, header);
-            pubKeyPoses(*this, header);
-            pubCameraPose(*this, header);
-            pubPointCloud(*this, header);
-            pubKeyframe(*this);
-            pubTF(*this, header);
+            pubOdometry(*this, header);     // 发布滑窗最新帧的位姿以及路径
+            pubKeyPoses(*this, header);     // 发布滑窗中所有帧的位置(世界坐标系下)
+            pubCameraPose(*this, header);   // 发布滑窗中次新帧的位姿(世界坐标系下)
+            pubPointCloud(*this, header);   // 发布滑窗中三角化成功的稳定特征点(世界坐标)；同时再挑出一批“即将被边缘化”的老点，单独发布
+            pubKeyframe(*this);             // 发布滑窗中次次新帧关键帧的位姿以及路标点
+            pubTF(*this, header);           // 发布tf变换（滑窗中最新帧世界坐标系到相机坐标系）以及外参
             mProcess.unlock();
         }
 
@@ -1088,10 +1088,11 @@ void Estimator::vector2double()
 
 void Estimator::double2vector()
 {
+    // 记录优化前的第0帧位姿，万一优化过程中失败了，可以恢复到这个位姿继续跟踪
     Vector3d origin_R0 = Utility::R2ypr(Rs[0]);
     Vector3d origin_P0 = Ps[0];
 
-    if (failure_occur)
+    if (failure_occur) // 如果检测到failure,改用上一次保存的稳定位姿
     {
         origin_R0 = Utility::R2ypr(last_R0);
         origin_P0 = last_P0;
@@ -1100,13 +1101,22 @@ void Estimator::double2vector()
 
     if(USE_IMU)
     {
+        // 取出优化后的第0帧姿态，并计算它与优化前第0帧姿态之间的yaw差值
         Vector3d origin_R00 = Utility::R2ypr(Quaterniond(para_Pose[0][6],
                                                           para_Pose[0][3],
                                                           para_Pose[0][4],
                                                           para_Pose[0][5]).toRotationMatrix());
         double y_diff = origin_R0.x() - origin_R00.x();
+        // 为什么只补yaw差值?
+        // 因为在VINS 里，重力能约束 pitch / roll，但全局 yaw 往往没有绝对观测，是自由的或弱观测的
+        // 在后端优化（比如 Ceres Solver 迭代求解）时，优化器的目标是让所有的误差（重投影误差、IMU 预积分误差）最小。
+        // 因为 Yaw 和全局平移是不可观的，优化器在调整相机轨迹时，这 4 个自由度处于“无根浮萍”的状态。
+        // 优化器在内部迭代中，很可能会为了凑一个极小的误差，把整个滑动窗口内的所有位姿在水平方向上整体转动了一个角度，或者整体平移了一段距离。
+        // 如果不处理这个现象，每次优化完，整个地图和轨迹的绝对朝向（Yaw）都会随机抖动，导致前后帧拼接时出现严重的断层
+        // 为了让输出连续、稳定，我们得让优化后的结果，尽量保持第 0 帧和优化前在同一个参考朝向、同一个参考原点
         //TODO
         Matrix3d rot_diff = Utility::ypr2R(Vector3d(y_diff, 0, 0));
+        // 万向节死锁保护: 欧拉角奇异点，yaw / roll 会耦合，单独拿 yaw 差来修正会不靠谱，直接用旋转矩阵的差值来修正
         if (abs(abs(origin_R0.y()) - 90) < 1.0 || abs(abs(origin_R00.y()) - 90) < 1.0)
         {
             ROS_DEBUG("euler singular point!");
@@ -1120,7 +1130,7 @@ void Estimator::double2vector()
         {
 
             Rs[i] = rot_diff * Quaterniond(para_Pose[i][6], para_Pose[i][3], para_Pose[i][4], para_Pose[i][5]).normalized().toRotationMatrix();
-            
+            // 补偿平移：先算相对平移，用 rot_diff 旋转，再叠加上原来的起点 origin_P0
             Ps[i] = rot_diff * Vector3d(para_Pose[i][0] - para_Pose[0][0],
                                     para_Pose[i][1] - para_Pose[0][1],
                                     para_Pose[i][2] - para_Pose[0][2]) + origin_P0;
@@ -1149,7 +1159,7 @@ void Estimator::double2vector()
             Ps[i] = Vector3d(para_Pose[i][0], para_Pose[i][1], para_Pose[i][2]);
         }
     }
-
+    // 更新相机-IMU外参
     if(USE_IMU)
     {
         for (int i = 0; i < NUM_OF_CAM; i++)
@@ -1163,7 +1173,7 @@ void Estimator::double2vector()
                                  para_Ex_Pose[i][5]).normalized().toRotationMatrix();
         }
     }
-
+    // 更新路标点深度
     VectorXd dep = f_manager.getDepthVector();
     for (int i = 0; i < f_manager.getFeatureCount(); i++)
         dep(i) = para_Feature[i][0];
@@ -1292,6 +1302,8 @@ void Estimator::optimization()
         for (int i = 0; i < frame_count; i++) // 滑窗中的所有相邻帧间都添加一个IMU预积分残差
         {
             int j = i + 1;
+            // 如果两帧之间的预积分时间间隔过大，可能静止了很久或者丢帧了
+            // 预积分的结果就不可靠了，这时就不添加这个残差了
             if (pre_integrations[j]->sum_dt > 10.0)
                 continue;
             // para_Pose[i], para_SpeedBias[i], para_Pose[j], para_SpeedBias[j]是该残差对应的待优化的变量块。
@@ -1879,12 +1891,14 @@ void Estimator::outliersRejection(set<int> &removeIndex)
     }
 }
 
+// 快速前向传播(得到世界坐标系下的最新位姿)
+// 因为是通过递推积分计算出的位姿，所以才会存在累积漂移。因为只要前面计算出的位姿存在误差，这个误差将会一直传递到后面的位姿计算中
 void Estimator::fastPredictIMU(double t, Eigen::Vector3d linear_acceleration, Eigen::Vector3d angular_velocity)
 {
     double dt = t - latest_time;
     latest_time = t;
     Eigen::Vector3d un_acc_0 = latest_Q * (latest_acc_0 - latest_Ba) - g;
-    Eigen::Vector3d un_gyr = 0.5 * (latest_gyr_0 + angular_velocity) - latest_Bg;
+    Eigen::Vector3d un_gyr = 0.5 * (latest_gyr_0 + angular_velocity) - latest_Bg; // 中值积分
     latest_Q = latest_Q * Utility::deltaQ(un_gyr * dt);
     Eigen::Vector3d un_acc_1 = latest_Q * (linear_acceleration - latest_Ba) - g;
     Eigen::Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1);
@@ -1894,8 +1908,11 @@ void Estimator::fastPredictIMU(double t, Eigen::Vector3d linear_acceleration, Ei
     latest_gyr_0 = angular_velocity;
 }
 
+// 当每次后端非线性优化完成后，得到了此前优化位置处的优化后位姿；然后
+// 从滑窗最后一帧的优化结果出发，用缓冲区里尚未进入优化的 IMU 数据，快速前向预测出当前时刻的最新状态。
 void Estimator::updateLatestStates()
 {
+    // 快速获取滑窗最新优化结果
     mPropagate.lock();
     latest_time = Headers[frame_count] + td;
     latest_P = Ps[frame_count];
@@ -1906,6 +1923,11 @@ void Estimator::updateLatestStates()
     latest_acc_0 = acc_0;
     latest_gyr_0 = gyr_0;
     mBuf.lock();
+    // 获取缓冲区中尚未进入优化的 IMU 数据
+    // 这是因为IMU的频率要比图像的频率高很多，因此在函数 getIMUInterval() 中将图像和对应的IMU数据装配后，imu_buf中还可能会剩余有imu数据；
+    // 另外在进行后端处理时，回调函数imu_callback()还是在并行的运行，imu_buf中还会添加imu数据。
+    // 因此，滑动窗口中的最新帧并不一定是当前imu帧，中间还隔着缓存队列的数据，
+    // 所以还需要使用缓存队列中的IMU数据进行递推积分得到当前帧的里程计信息，使得实时性更高
     queue<pair<double, Eigen::Vector3d>> tmp_accBuf = accBuf;
     queue<pair<double, Eigen::Vector3d>> tmp_gyrBuf = gyrBuf;
     mBuf.unlock();
